@@ -1,0 +1,172 @@
+diff --git a/include/v8.h b/include/v8.h
+index c09f610..db7a1dc 100644
+--- a/include/v8.h
++++ b/include/v8.h
+@@ -1717,6 +1717,32 @@ class V8_EXPORT StackTrace {
+    */
+   static Local<StackTrace> CurrentStackTrace(
+       Isolate* isolate, int frame_limit, StackTraceOptions options = kDetailed);
++
++  /**
++   * Grab a snapshot of the current JavaScript execution stack,
++   * which only contains the top (newest) StackFrame.
++   *
++   * \param frame_limit The maximum number of stack frames we want to capture.
++   * \param options Enumerates the set of things we will capture for each
++   *   StackFrame.
++   */
++  static Local<StackTrace> TopFrameStackTrace(
++      Isolate* isolate,
++      int frame_limit,
++      StackTraceOptions options = kDetailed);
++
++  /**
++   * Grab a snapshot of the current JavaScript execution stack,
++   * which only contains the bottom (oldest) StackFrame.
++   *
++   * \param frame_limit The maximum number of stack frames we want to capture.
++   * \param options Enumerates the set of things we will capture for each
++   *   StackFrame.
++   */
++  static Local<StackTrace> BottomFrameStackTrace(
++      Isolate* isolate,
++      int frame_limit,
++      StackTraceOptions options = kDetailed);
+ };
+ 
+ 
+diff --git a/src/api.cc b/src/api.cc
+index d92d796..634e44f 100644
+--- a/src/api.cc
++++ b/src/api.cc
+@@ -3102,6 +3102,30 @@ Local<StackTrace> StackTrace::CurrentStackTrace(
+ }
+ 
+ 
++Local<StackTrace> StackTrace::TopFrameStackTrace(
++    Isolate* isolate,
++    int frame_limit,
++    StackTraceOptions options) {
++  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
++  ENTER_V8_NO_SCRIPT_NO_EXCEPTION(i_isolate);
++  i::Handle<i::FixedArray> stackTrace =
++      i_isolate->CaptureTopOrBottomFrameStackTrace(frame_limit, options, true);
++  return Utils::StackTraceToLocal(stackTrace);
++}
++
++
++Local<StackTrace> StackTrace::BottomFrameStackTrace(
++    Isolate* isolate,
++    int frame_limit,
++    StackTraceOptions options) {
++  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
++  ENTER_V8_NO_SCRIPT_NO_EXCEPTION(i_isolate);
++  i::Handle<i::FixedArray> stackTrace =
++      i_isolate->CaptureTopOrBottomFrameStackTrace(frame_limit, options, false);
++  return Utils::StackTraceToLocal(stackTrace);
++}
++
++
+ // --- S t a c k F r a m e ---
+ 
+ int StackFrame::GetLineNumber() const {
+diff --git a/src/isolate.cc b/src/isolate.cc
+index e3ee968..4b006dc 100644
+--- a/src/isolate.cc
++++ b/src/isolate.cc
+@@ -828,6 +828,82 @@ Handle<FixedArray> Isolate::CaptureCurrentStackTrace(
+ }
+ 
+ 
++Handle<FixedArray> Isolate::CaptureTopOrBottomFrameStackTrace(
++    int frame_limit, StackTrace::StackTraceOptions options, bool top) {
++  DisallowJavascriptExecution no_js(this);
++  CaptureStackTraceHelper helper(this);
++
++  // Ensure no negative values.
++  int limit = Max(frame_limit, 0);
++  Handle<FixedArray> stack_trace_elems = factory()->NewFixedArray(limit);
++
++  int frames_seen = 0;
++  StandardFrame* frame = NULL;
++  std::vector<StandardFrame*> JS_frames;
++  for (StackTraceFrameIterator it(this); !it.done() && (frames_seen < limit);
++       it.Advance()) {
++    frame = it.frame();
++    if (frame->is_java_script()) {
++      JS_frames.push_back(frame);
++      //if (top)
++        //break;
++    }
++  }
++  size_t num_JS_frames = JS_frames.size();
++  long k = num_JS_frames;
++  if (top)
++    k = -1;
++  StandardFrame* current_JS_frame = NULL;
++  while (true) {
++    if (top) {
++      if (static_cast<size_t>(k + 1) == num_JS_frames) break;
++      k++;
++    }
++    else {
++      if (k == 0) break;
++      k--;
++    }
++    // Set initial size to the maximum inlining level + 1 for the outermost
++    // function.
++    std::vector<FrameSummary> frames;
++    current_JS_frame = JS_frames[k];
++    if (!current_JS_frame)
++      continue;
++    current_JS_frame->Summarize(&frames);
++
++    size_t num_frames = frames.size();
++    long i = -1;
++    if (top)
++      i = num_frames;
++    while (true) {
++      if (top) {
++        if (i == 0) break;
++        i--;
++      }
++      else {
++        if (static_cast<size_t>(i + 1) == num_frames) break;
++        i++;
++      }
++      FrameSummary& frame = frames[i];
++      if (!frame.is_subject_to_debugging()) continue;
++      // Filter frames from other security contexts.
++      if (!(options & StackTrace::kExposeFramesAcrossSecurityOrigins) &&
++          !this->context()->HasSameSecurityTokenAs(*frame.native_context()))
++        continue;
++      Handle<StackFrameInfo> new_frame_obj = helper.NewStackFrameObject(frame);
++      stack_trace_elems->set(frames_seen, *new_frame_obj);
++      frames_seen++;
++      break;
++    }
++    if (frames_seen > 0)
++      break;
++  }
++  
++  stack_trace_elems->Shrink(frames_seen);
++  return stack_trace_elems;
++}
++
++
+ void Isolate::PrintStack(FILE* out, PrintStackMode mode) {
+   if (stack_trace_nesting_level_ == 0) {
+     stack_trace_nesting_level_++;
+diff --git a/src/isolate.h b/src/isolate.h
+index 9e3de53..c5f775e 100644
+--- a/src/isolate.h
++++ b/src/isolate.h
+@@ -743,6 +743,8 @@ class Isolate {
+                                        void* ptr8, unsigned int magic2));
+   Handle<FixedArray> CaptureCurrentStackTrace(
+       int frame_limit, StackTrace::StackTraceOptions options);
++  Handle<FixedArray> CaptureTopOrBottomFrameStackTrace(
++      int frame_limit, StackTrace::StackTraceOptions options, bool top);
+   Handle<Object> CaptureSimpleStackTrace(Handle<JSReceiver> error_object,
+                                          FrameSkipMode mode,
+                                          Handle<Object> caller);
