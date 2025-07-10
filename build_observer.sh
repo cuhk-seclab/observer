@@ -3,11 +3,10 @@
 
 set -o nounset                              # Treat unset variables as an error
 
-VERSION=64.0.3282.186
+VERSION=130.0.6722.0
 NTHREADS=32 # Number of *gclient sync* threads
-TMPFS_SIZE=20G # Size of tmpfs in memory for build path. You need at least 20G memory for a DEBUG build.
 BUILD_DIR=Observer # Change this if you want to build at a different directory, e.g., Release
-PATCH_DIR=patch # Change this if you put the .patch files at a different directory
+PATCH_DIR="patch" # Change this if you put the .patch files at a different directory
 
 
 
@@ -51,14 +50,26 @@ fetch_source ()
 {
   git config --global core.precomposeUnicode true
   fetch --nohooks chromium
-  cd $CHROMIUM/src
+  cd "$CHROMIUM/src" || return
   git checkout -b dev $VERSION
+  COMMIT_DATE=$(git log -n 1 --pretty=format:%ci)
+  if [[ -n "$DEPOT_TOOLS_PATH" && -d "$DEPOT_TOOLS_PATH" ]] ; then
+    cd "$DEPOT_TOOLS_PATH" || return
+    DEPOT_TOOLS_VERSION=$(git rev-list -n 1 --before="$COMMIT_DATE" main)
+    git checkout "$DEPOT_TOOLS_VERSION"
+    export DEPOT_TOOLS_UPDATE=0
+    cd "$CHROMIUM/src" || return
+    git clean -ffd
+  else
+    echo "\$DEPOT_TOOLS_PATH does not been set correctly. Please set up compaatible depot_tools manually following the instruction from https://chromium.googlesource.com/chromium/src/+/HEAD/docs/building_old_revisions.md"
+    exit
+  fi
 } # ----------  end of function fetch_source ----------
 
 # SYNC ALL FILES WITH THE CHECKOUT VERSION
 gclient_sync ()
 {
-  gclient sync --with_branch_heads --jobs $NTHREADS
+  gclient sync --with_branch_heads --jobs $NTHREADS --force --reset
 } # ----------  end of function gclient_sync ----------
 
 # INSTALL BUILD DEPENDENCIES
@@ -69,7 +80,7 @@ install_deps ()
     if hash port 2>/dev/null; then
       sudo port install wget ccache docbook2X autoconf automake libtool
       sudo mkdir -p /usr/local/opt/lzo/lib/
-      cd /usr/local/opt/lzo/lib/
+      cd /usr/local/opt/lzo/lib/ || exit
       sudo ln -s /opt/local/lib/liblzo2.2.dylib . 2>/dev/null
     elif hash brew 2>/dev/null; then
       brew install wget ccache autoconf automake libtool
@@ -82,7 +93,7 @@ install_deps ()
   elif [ $is_linux = 1 ]; then
     sudo apt-get install ccache
     echo ""
-    cd $CHROMIUM/src
+    cd "$CHROMIUM/src" || exit
     sudo ./build/install-build-deps.sh --no-syms --no-arm --no-chromeos-fonts --no-nacl
   fi
 } # ----------  end of function install_deps ----------
@@ -91,7 +102,7 @@ install_deps ()
 # RUN Chromium-specific hooks
 run_hooks ()
 {
-  cd $CHROMIUM/src
+  cd "$CHROMIUM/src" || exit
   gclient runhooks
 } # ----------  end of function run_hooks ----------
 
@@ -99,15 +110,14 @@ run_hooks ()
 # APPLY OBSERVER PATCHES
 apply_patch ()
 {
-  cd $CHROMIUM/src/third_party/WebKit/Source && patch -p1 < $ROOT/$PATCH_DIR/webkit.patch
-  cd $CHROMIUM/src/v8 && patch -p1 < $ROOT/$PATCH_DIR/v8.patch
+  cd "$CHROMIUM/src" && patch -p1 < "$ROOT/$PATCH_DIR/blink.patch"
 
 } # ----------  end of function apply_patch ----------
 
 # BUILD
 conf_local_build ()
 {
-  cd $CHROMIUM/src
+  cd "$CHROMIUM/src" || exit
   mkdir -p out/$BUILD_DIR
   gn gen out/$BUILD_DIR '--args=cc_wrapper="ccache" use_jumbo_build=true is_debug=false enable_nacl=false'
 } # ----------  end of function conf_local_build ----------
@@ -115,20 +125,20 @@ conf_local_build ()
 build_local ()
 {
   export CCACHE_BASEDIR=$CHROMIUM
-  cd $CHROMIUM/src
+  cd "$CHROMIUM/src" || exit
   time autoninja -C out/$BUILD_DIR chrome
 } # ----------  end of function build_local ----------
 
 
 mkdir -p chromium
 ROOT=$PWD
-cd chromium
+cd chromium || exit
 CHROMIUM=$PWD
 
 if [ $# -gt 0 ]; then
   if [ "$1" != "" ] ; then
     case "$1" in
-      --fetch|--sync|--deps|--patch|--run-hooks|--mount-tmpfs|--umount-tmpfs|--conf-local|--build-local|--all|--help )
+      --fetch|--sync|--deps|--patch|--run-hooks|--conf-local|--build-local|--all|--help )
         if [ "$1" = "--fetch" ] || [ "$1" = "--all" ]; then
           fetch_source
         fi
@@ -156,7 +166,7 @@ if [ $# -gt 0 ]; then
         ;;
 
       *)
-        echo "Your option "\"$1\"" is invalid"
+        echo "Your option \"$1\" is invalid"
         exit
         ;;
 
