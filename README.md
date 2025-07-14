@@ -91,6 +91,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Mingxue Zhang <mxzhang@cse.cuhk.edu.hk>
 
+Linlin Zhou <freyja@link.cuhk.edu.hk> & Yuting Wu <1155215797@link.cuhk.edu.hk> (Migrated the project to chromium 130.0)
+
 ## Contact
 
 [Wei Meng](https://www.cse.cuhk.edu.hk/~wei/) <wei@cse.cuhk.edu.hk>
