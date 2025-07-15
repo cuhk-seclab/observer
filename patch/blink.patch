@@ -1,0 +1,2203 @@
+diff --git a/third_party/blink/renderer/bindings/bindings.gni b/third_party/blink/renderer/bindings/bindings.gni
+index 0ad14d4e8df12..048f1ff2e7521 100644
+--- a/third_party/blink/renderer/bindings/bindings.gni
++++ b/third_party/blink/renderer/bindings/bindings.gni
+@@ -75,6 +75,8 @@ blink_core_sources_bindings =
+                     "core/v8/script_cache_consumer.cc",
+                     "core/v8/script_cache_consumer.h",
+                     "core/v8/script_cache_consumer_client.h",
++                    "core/v8/script_call_stack_factory.cc",
++                    "core/v8/script_call_stack_factory.h",
+                     "core/v8/script_controller.cc",
+                     "core/v8/script_controller.h",
+                     "core/v8/script_custom_element_definition.cc",
+diff --git a/third_party/blink/renderer/bindings/core/v8/binding_security.cc b/third_party/blink/renderer/bindings/core/v8/binding_security.cc
+index 294df02d67344..c13f2a7d00afd 100644
+--- a/third_party/blink/renderer/bindings/core/v8/binding_security.cc
++++ b/third_party/blink/renderer/bindings/core/v8/binding_security.cc
+@@ -32,6 +32,7 @@
+ 
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_location.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_window.h"
+@@ -43,16 +44,19 @@
+ #include "third_party/blink/renderer/core/frame/location.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
++#include "third_party/blink/renderer/core/html/html_anchor_element.h"
+ #include "third_party/blink/renderer/core/html/html_document.h"
+ #include "third_party/blink/renderer/core/html/html_frame_element_base.h"
++#include "third_party/blink/renderer/core/html/html_script_element.h"
+ #include "third_party/blink/renderer/core/html/image_document.h"
+ #include "third_party/blink/renderer/core/html/media/media_document.h"
+ #include "third_party/blink/renderer/core/html/text_document.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
++#include "third_party/blink/renderer/platform/json/json_values.h"
+ #include "third_party/blink/renderer/platform/web_test_support.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+-
++#include "v8-isolate.h"
+ namespace blink {
+ 
+ namespace {
+@@ -314,4 +318,217 @@ void BindingSecurity::FailedAccessCheckFor(v8::Isolate* isolate,
+                                             cross_document_access));
+ }
+ 
++void BindingSecurity::LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                         EventTarget* target,
++                                         DOMAccessRequest accessRequest,
++                                         const String& memberName,
++                                         const String& argument) {
++  if (IsObserverEnabled() && target) {
++    Node* node = target->ToNode();
++    if (node) {
++      LogAccessToElement(accessing_window, node, accessRequest, memberName,
++                         argument);
++    }
++  }
++  return;
++}
++
++void BindingSecurity::LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                         Node* target,
++                                         DOMAccessRequest accessRequest,
++                                         const String& memberName,
++                                         const String& argument) {
++  if (IsObserverEnabled() && target) {
++    if (target->IsPseudoElement()) {
++      return;
++    }
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++    if ((target->IsElementNode() || target->IsDocumentNode())) {
++      LogAccessToElement(accessing_window, target, accessRequest, memberName,
++                         frame, argument);
++    }
++  }
++  return;
++}
++
++void BindingSecurity::LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                         Node* target,
++                                         DOMAccessRequest accessRequest,
++                                         const String& memberName,
++                                         const v8::Local<v8::StackFrame>& frame,
++                                         const String& argument) {
++  if (IsObserverEnabled() && target) {
++    if (target->IsPseudoElement()) {
++      return;
++    }
++    if (!(IsA<HTMLAnchorElement>(target) || IsA<HTMLScriptElement>(target))) {
++      return;
++    }
++
++    if (target->IsElementNode() || target->IsDocumentNode()) {
++      DLOG(WARNING) << "call LogAccessToElement , frame.IsEmpty(): "
++                    << frame.IsEmpty();
++      Document& document = target->GetDocument();
++      int accessID = document.accessCount();
++      StringBuilder log;
++      log.Append("{\"info\" :\"");
++      log.AppendNumber(accessID);
++      log.Append(':');
++      log.AppendNumber(target->IsInTreeScope());
++      log.Append(':');
++      log.AppendNumber(static_cast<int>(accessRequest));
++      log.Append(':');
++      log.Append(memberName);
++      log.Append('"');
++
++      String stack = "";
++
++      String frameSourceURL =
++          !frame.IsEmpty()
++              ? toCoreStringOrDefault(v8::Isolate::GetCurrent(),
++                                      frame->GetScriptNameOrSourceURL(),
++                                      "<anonymous>")
++              : "<anonymous>";
++      DLOG(WARNING) << "LogAccessToElement: frameSourceURL=" << frameSourceURL;
++      const KURL callerSourceURL = KURL(frameSourceURL);
++      String protocol = callerSourceURL.Protocol();
++      DLOG(WARNING) << "Protocol: " << protocol;
++      if (!IsChromeURL(protocol) && !IsExtensionURL(protocol)) {
++        int scriptID = frame->GetScriptId();
++        document.setScriptID2URL(scriptID, frameSourceURL);
++        stack = String::Number(scriptID);
++      }
++
++      unsigned stack_length = stack.length();
++      if (stack_length > 0) {
++        log.Append(", \"stack\": ");
++        log.Append(JSONValue::QuoteString(stack));
++      }
++
++      log.Append(argument);
++      log.Append("}");
++      auto log_str = JSONValue::QuoteString(log.ReleaseString());
++
++      if (IsA<HTMLAnchorElement>(target)) {
++        To<HTMLAnchorElement>(target)->appendObserverLog(log_str);
++      } else {  // html script element
++        To<HTMLScriptElement>(target)->appendObserverLog(log_str);
++      }
++      LOG(WARNING) << log_str;
++    }
++  }
++}
++
++void BindingSecurity::SetNodeAndChildrenInitiator(Document* document,
++                                                  Node* node,
++                                                  bool setChildren) {
++  if (IsObserverEnabled() && node) {
++    LOG(WARNING) << "call SetNodeAndChildrenInitiator";
++    if (node->IsPseudoElement()) {
++      return;
++    }
++
++    v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++    String initiator = "";
++
++    String frameSourceURL =
++        !frame.IsEmpty() ? toCoreStringOrDefault(
++                               v8::Isolate::GetCurrent(),
++                               frame->GetScriptNameOrSourceURL(), "<anonymous>")
++                         : "<anonymous>";
++    LOG(WARNING) << "SetNodeAndChildInitiator: " << frameSourceURL;
++    const KURL callerSourceURL = KURL(frameSourceURL);
++    if (!IsChromeURL(callerSourceURL.Protocol()) &&
++        !IsExtensionURL(callerSourceURL.Protocol())) {
++      int scriptID = frame->GetScriptId();
++      document->setScriptID2URL(scriptID, frameSourceURL);
++      initiator = String::Number(scriptID);
++    }
++    if (setChildren) {
++      if (IsA<HTMLAnchorElement>(node)) {
++        To<HTMLAnchorElement>(node)->setChildrenInitiator(initiator);
++      } else if (IsA<HTMLScriptElement>(node)) {
++        To<HTMLScriptElement>(node)->setChildrenInitiator(initiator);
++      } else {
++        NodeList* children = node->childNodes();
++        int length = children->length();
++        for (int j = 0; j < length; ++j) {
++          Node* child = children->item(j);
++          if (child->IsElementNode()) {
++            if (IsA<HTMLAnchorElement>(child)) {
++              To<HTMLAnchorElement>(child)->setChildrenInitiator(initiator);
++            } else if (IsA<HTMLScriptElement>(child)) {
++              To<HTMLScriptElement>(child)->setChildrenInitiator(initiator);
++            }
++          }
++        }
++      }
++    } else {
++      if (IsA<HTMLAnchorElement>(node)) {
++        To<HTMLAnchorElement>(node)->setInitiator(initiator);
++      } else if (IsA<HTMLScriptElement>(node)) {
++        To<HTMLScriptElement>(node)->setInitiator(initiator);
++      }
++    }
++    LOG(WARNING) << "SetNodeAndChildrenInitiator" << initiator << " "
++                 << frameSourceURL;
++  }
++}
++
++void BindingSecurity::LogAPIAccess(Document* document,
++                                   const String& api,
++                                   const String& url) {
++  CHECK(document);
++  int nid = document->getCurrentEventTarget();
++
++  v8::Local<v8::StackFrame> frame = getBottomFrame(maxCallStackSizeToCapture);
++
++  StringBuilder log;
++  log.Append("{\"nid\": ");
++  log.AppendNumber(nid);
++  log.Append(R"(, "type": ")");
++  log.Append(document->getCurrentEventType());
++  log.Append(R"(", "API": ")");
++  log.Append(api);
++  log.Append(R"(", "url": )");
++  log.Append(JSONValue::QuoteString(url));
++  LOG(WARNING) << "LogAPIAccess: " << nid << " " << log.ToString();
++  if (nid >= 0) {
++    String stack = "";
++    String frameSourceURL =
++        !frame.IsEmpty() ? toCoreStringOrDefault(
++                               v8::Isolate::GetCurrent(),
++                               frame->GetScriptNameOrSourceURL(), "<anonymous>")
++                         : "<anonymous>";
++
++    const KURL callerSourceURL = KURL(frameSourceURL);
++    if (!IsChromeURL(callerSourceURL.Protocol()) &&
++        !IsExtensionURL(callerSourceURL.Protocol())) {
++      int scriptID = frame->GetScriptId();
++      document->setScriptID2URL(scriptID, frameSourceURL);
++      stack = String::Number(scriptID);
++    }
++    unsigned stack_length = stack.length();
++    if (stack_length > 0) {
++      log.Append(", \"stack\": ");
++      log.Append(JSONValue::QuoteString(stack));
++    }
++  }
++  log.Append("}");
++  auto res = log.ReleaseString();
++  document->appendAPILog(res);
++}
++
++bool BindingSecurity::IsChromeURL(const String& protocol) {
++  if (protocol.empty() || protocol == "chrome" ||
++      protocol == "chrome-devtools" || protocol == "chrome-search") {
++    return true;
++  }
++  return false;
++}
++
++bool BindingSecurity::IsExtensionURL(const String& protocol) {
++  return protocol == "chrome-extension";
++}
++
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/bindings/core/v8/binding_security.h b/third_party/blink/renderer/bindings/core/v8/binding_security.h
+index 7d09384ead43a..16869ea34afb7 100644
+--- a/third_party/blink/renderer/bindings/core/v8/binding_security.h
++++ b/third_party/blink/renderer/bindings/core/v8/binding_security.h
+@@ -31,7 +31,11 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_BINDINGS_CORE_V8_BINDING_SECURITY_H_
+ #define THIRD_PARTY_BLINK_RENDERER_BINDINGS_CORE_V8_BINDING_SECURITY_H_
+ 
++#include "third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h"
+ #include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/dom/events/event_target.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
+ #include "third_party/blink/renderer/platform/bindings/binding_security_for_platform.h"
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+ #include "v8/include/v8.h"
+@@ -109,6 +113,32 @@ class CORE_EXPORT BindingSecurity {
+                                    v8::Local<v8::Object> holder,
+                                    ExceptionState&);
+ 
++  // Log the caller (|accessingScript|)'s access to the DOM element (|target).
++  static void LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                 EventTarget* target,
++                                 DOMAccessRequest accessRequest,
++                                 const String&,
++                                 const String& argument = "");
++  static void LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                 Node* target,
++                                 DOMAccessRequest accessRequest,
++                                 const String&,
++                                 const String& argument = "");
++  static void LogAccessToElement(const LocalDOMWindow* accessing_window,
++                                 Node* target,
++                                 DOMAccessRequest accessRequest,
++                                 const String&,
++                                 const v8::Local<v8::StackFrame>&,
++                                 const String& argument = "");
++  static void SetNodeAndChildrenInitiator(Document* document,
++                                          Node* node,
++                                          bool setChildren = false);
++  static void LogAPIAccess(Document* document,
++                           const String& api,
++                           const String& url);
++  static bool IsChromeURL(const String&);
++  static bool IsExtensionURL(const String&);
++
+  private:
+   static bool ShouldAllowAccessToV8ContextInternal(
+       ScriptState* accessing_script_state,
+diff --git a/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.cc b/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.cc
+new file mode 100644
+index 0000000000000..4c4c25551d8c4
+--- /dev/null
++++ b/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.cc
+@@ -0,0 +1,35 @@
++#include "third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h"
++
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++namespace blink {
++
++v8::Local<v8::StackFrame> getBottomFrame(int maxStackSize) {
++  LOG(WARNING) << "Observer: Getting bottom frame";
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  if (!isolate || !isolate->InContext()) {
++    LOG(WARNING) << "!isolate || !isolate->InContext()";
++    return {};
++  }
++  v8::EscapableHandleScope handleScope(isolate);
++  v8::Local<v8::StackTrace> stackTrace = v8::StackTrace::CurrentStackTrace(
++      isolate, maxStackSize, stackTraceOptions);
++  if (stackTrace.IsEmpty() || stackTrace->GetFrameCount() <= 0) {
++    LOG(WARNING) << "stackTrace.IsEmpty() || stackTrace->GetFrameCount() <= 0";
++    return {};
++  }
++  int index = stackTrace->GetFrameCount() - 1;
++  return handleScope.Escape(stackTrace->GetFrame(isolate, index));
++}
++
++String toCoreStringOrDefault(v8::Isolate* isolate,
++                             const v8::Local<v8::String>& v8_string,
++                             const String& dflt) {
++  if (!isolate || v8_string.IsEmpty()) {
++    return dflt;
++  }
++  return ToCoreString(isolate, v8_string);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h b/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h
+new file mode 100644
+index 0000000000000..5a107034415a3
+--- /dev/null
++++ b/third_party/blink/renderer/bindings/core/v8/script_call_stack_factory.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (c) 2010 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_BINDINGS_CORE_V8_SCRIPT_CALL_STACK_FACTORY_H_
++#define THIRD_PARTY_BLINK_RENDERER_BINDINGS_CORE_V8_SCRIPT_CALL_STACK_FACTORY_H_
++
++#include "third_party/blink/renderer/platform/wtf/forward.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++#include <v8.h>
++
++namespace blink {
++
++const v8::StackTrace::StackTraceOptions stackTraceOptions = static_cast<v8::StackTrace::StackTraceOptions>(
++      v8::StackTrace::kLineNumber
++    | v8::StackTrace::kColumnOffset
++    | v8::StackTrace::kScriptId
++    | v8::StackTrace::kScriptNameOrSourceURL
++    | v8::StackTrace::kFunctionName);
++
++constexpr int maxCallStackSizeToCapture = 200;
++
++v8::Local<v8::StackFrame> getBottomFrame(int maxStackSize);
++
++String toCoreStringOrDefault(v8::Isolate*, const v8::Local<v8::String>&, const String&);
++
++} // namespace blink
++
++
++#endif //THIRD_PARTY_BLINK_RENDERER_BINDINGS_CORE_V8_SCRIPT_CALL_STACK_FACTORY_H_
+diff --git a/third_party/blink/renderer/bindings/core/v8/script_controller.h b/third_party/blink/renderer/bindings/core/v8/script_controller.h
+index 72db793f4dfeb..3ed57bf32c854 100644
+--- a/third_party/blink/renderer/bindings/core/v8/script_controller.h
++++ b/third_party/blink/renderer/bindings/core/v8/script_controller.h
+@@ -119,6 +119,9 @@ class CORE_EXPORT ScriptController final
+   static void RegisterExtensionIfNeeded(std::unique_ptr<v8::Extension>);
+   static v8::ExtensionConfiguration ExtensionsFor(const ExecutionContext*);
+ 
++  int scriptID() const { return script_id_; }
++  void setScriptID(int scriptID = -1) { script_id_ = scriptID; }
++
+  private:
+   bool CanExecuteScript(ExecuteScriptPolicy policy);
+   v8::Isolate* GetIsolate() const;
+@@ -135,6 +138,8 @@ class CORE_EXPORT ScriptController final
+ 
+   const Member<LocalDOMWindow> window_;
+   const Member<LocalWindowProxyManager> window_proxy_manager_;
++
++  int script_id_ = -1;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/bindings/core/v8/v8_script_runner.cc b/third_party/blink/renderer/bindings/core/v8/v8_script_runner.cc
+index 7867261df8455..9c74d85224de1 100644
+--- a/third_party/blink/renderer/bindings/core/v8/v8_script_runner.cc
++++ b/third_party/blink/renderer/bindings/core/v8/v8_script_runner.cc
+@@ -35,6 +35,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/bindings/core/v8/referrer_script_info.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_cache_consumer.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_evaluation_result.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_function.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_streamer.h"
+@@ -515,6 +516,12 @@ v8::MaybeLocal<v8::Value> V8ScriptRunner::RunCompiledScript(
+     probe::ExecuteScript probe(context, isolate->GetCurrentContext(), url,
+                                script->GetUnboundScript()->GetId());
+     result = script->Run(isolate->GetCurrentContext(), host_defined_options);
++
++    if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
++      int scriptID = script->GetUnboundScript()->GetId();
++      window->document()->setScriptID2URL(scriptID, url);
++      window->GetScriptController().setScriptID(scriptID);
++    }
+   }
+ 
+   CHECK(!isolate->IsDead());
+diff --git a/third_party/blink/renderer/bindings/scripts/bind_gen/interface.py b/third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
+index d25512891f4bc..f6f5d67ac44e8 100644
+--- a/third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
++++ b/third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
+@@ -1103,9 +1103,9 @@ def make_check_security_of_return_value(cg_context):
+ 
+     T = TextNode
+ 
+-    check_security = cg_context.member_like.extended_attributes.value_of(
++    check_security = cg_context.member_like.extended_attributes.values_of(
+         "CheckSecurity")
+-    if check_security != "ReturnValue":
++    if "ReturnValue" not in check_security:
+         return None
+ 
+     web_feature = _format(
+@@ -1134,6 +1134,108 @@ def make_check_security_of_return_value(cg_context):
+     return node
+ 
+ 
++def make_check_security_of_caller(cg_context, function_name):
++    assert isinstance(cg_context, CodeGenContext)
++    assert isinstance(function_name, str)
++
++    T = TextNode
++
++    check_security = []
++
++    if cg_context.member_like:
++        check_security = cg_context.member_like.extended_attributes.values_of(
++            "CheckSecurity"
++        )
++
++    if cg_context.class_like:
++        check_security += cg_context.class_like.extended_attributes.values_of(
++            "CheckSecurity"
++        )
++
++    if "Caller" not in check_security:
++        return None
++
++    if operation := cg_context.operation:
++        function_name = operation.identifier
++
++    if cg_context.attribute_get:
++        access_request_type = "ATTEMPT_TO_READ"
++    elif cg_context.attribute_set or function_name in (
++        "setAttribute",
++        "setAttributeNS",
++        "removeAttribute",
++        "removeAttributeNS",
++    ):
++        if "WriteSelf" in check_security:
++            access_request_type = "ATTEMPT_TO_WRITE_EXECUTE"
++        else:
++            access_request_type = "ATTEMPT_TO_WRITE"
++    else:
++        return None
++
++    # print(
++    #     cg_context,
++    #     access_request_type,
++    #     cg_context.class_like.identifier,
++    #     function_name,
++    # )
++
++    node = SequenceNode(
++        [
++            T("// [CheckSecurity=Caller]"),
++        ]
++    )
++    node.add_template_var("method_name", function_name)
++    node.append(
++        T(
++            "BindingSecurity::LogAccessToElement("
++            "ToLocalDOMWindow(${current_context}), ${blink_receiver}, "
++            + access_request_type
++            + ', "${method_name}");'
++        )
++    )
++
++    node.append(T('LOG(ERROR) << "LogAccessToElement" << "${method_name}";'))
++
++    node.accumulate(
++        CodeGenAccumulator.require_include_headers(
++            [
++                "third_party/blink/renderer/bindings/core/v8/binding_security.h",
++            ]
++        )
++    )
++    return node
++
++
++def make_check_security_of_creation(cg_context, function_name):
++    assert isinstance(cg_context, CodeGenContext)
++    assert isinstance(function_name, str)
++
++    T = TextNode
++    check_security = cg_context.operation.extended_attributes.values_of("CheckSecurity")
++
++    if "Creation" not in check_security:
++        return None
++
++    node = SequenceNode(
++        [
++            T("// [CheckSecurity=Creation]"),
++            T(
++                "BindingSecurity::SetNodeAndChildrenInitiator(${blink_receiver}, ${return_value}, true);"
++            ),
++        ]
++    )
++
++    node.accumulate(
++        CodeGenAccumulator.require_include_headers(
++            [
++                "third_party/blink/renderer/bindings/core/v8/binding_security.h",
++            ]
++        )
++    )
++    return node
++
++
+ def make_cooperative_scheduling_safepoint(cg_context):
+     assert isinstance(cg_context, CodeGenContext)
+ 
+@@ -1840,8 +1942,8 @@ def make_v8_set_return_value(cg_context):
+         T("return;")
+     ]
+ 
+-    if (cg_context.member_like.extended_attributes.value_of("CheckSecurity") ==
+-            "ReturnValue"):
++    if ("ReturnValue" in cg_context.member_like.extended_attributes.values_of("CheckSecurity")
++            ):
+         node = CxxBlockNode([
+             T("// [CheckSecurity=ReturnValue]"),
+             F(
+@@ -2032,26 +2134,29 @@ def make_attribute_get_callback_def(cg_context, function_name):
+     func_def = _make_empty_callback_def(cg_context, function_name)
+     body = func_def.body
+ 
+-    body.extend([
+-        make_check_receiver(cg_context),
+-        EmptyNode(),
+-        make_runtime_call_timer_scope(cg_context),
+-        make_bindings_trace_event(cg_context),
+-        make_report_coop_access(cg_context),
+-        make_report_deprecate_as(cg_context),
+-        make_report_high_entropy(cg_context),
+-        make_report_measure_as(cg_context),
+-        make_log_activity(cg_context),
+-        EmptyNode(),
+-        make_check_proxy_access(cg_context),
+-        EmptyNode(),
+-        make_return_value_cache_return_early(cg_context),
+-        EmptyNode(),
+-        make_check_security_of_return_value(cg_context),
+-        make_v8_set_return_value(cg_context),
+-        make_report_high_entropy_direct(cg_context),
+-        make_return_value_cache_update_value(cg_context),
+-    ])
++    body.extend(
++        [
++            make_check_receiver(cg_context),
++            EmptyNode(),
++            make_runtime_call_timer_scope(cg_context),
++            make_bindings_trace_event(cg_context),
++            make_report_coop_access(cg_context),
++            make_report_deprecate_as(cg_context),
++            make_report_high_entropy(cg_context),
++            make_report_measure_as(cg_context),
++            make_log_activity(cg_context),
++            EmptyNode(),
++            make_check_proxy_access(cg_context),
++            EmptyNode(),
++            make_return_value_cache_return_early(cg_context),
++            EmptyNode(),
++            make_check_security_of_return_value(cg_context),
++            make_check_security_of_caller(cg_context, function_name),
++            make_v8_set_return_value(cg_context),
++            make_report_high_entropy_direct(cg_context),
++            make_return_value_cache_update_value(cg_context),
++        ]
++    )
+     if cg_context.is_interceptor_returning_v8intercepted:
+         body.append(TextNode("return v8::Intercepted::kYes;"))
+ 
+@@ -2076,17 +2181,20 @@ def make_attribute_set_callback_def(cg_context, function_name):
+         body.append(TextNode("// [LegacyLenientSetter]"))
+         return func_def
+ 
+-    body.extend([
+-        make_check_receiver(cg_context),
+-        EmptyNode(),
+-        make_runtime_call_timer_scope(cg_context),
+-        make_bindings_trace_event(cg_context),
+-        make_report_deprecate_as(cg_context),
+-        make_report_high_entropy(cg_context),
+-        make_report_measure_as(cg_context),
+-        make_log_activity(cg_context),
+-        EmptyNode(),
+-    ])
++    body.extend(
++        [
++            make_check_receiver(cg_context),
++            EmptyNode(),
++            make_runtime_call_timer_scope(cg_context),
++            make_bindings_trace_event(cg_context),
++            make_report_deprecate_as(cg_context),
++            make_report_high_entropy(cg_context),
++            make_report_measure_as(cg_context),
++            make_log_activity(cg_context),
++            make_check_security_of_caller(cg_context, function_name),
++            EmptyNode(),
++        ]
++    )
+ 
+     # Binary size reduction hack
+     # 1. Drop the check of argument length although this is a violation of
+@@ -2712,25 +2820,29 @@ def make_operation_function_def(cg_context, function_name):
+         body.append(make_operation_entry(cg_context))
+         body.append(EmptyNode())
+ 
+-    body.extend([
+-        make_check_receiver(cg_context),
+-        EmptyNode(),
+-        make_report_coop_access(cg_context),
+-        make_report_deprecate_as(cg_context),
+-        make_report_high_entropy(cg_context),
+-        make_report_measure_as(cg_context),
+-        make_log_activity(cg_context),
+-        EmptyNode(),
+-        make_check_proxy_access(cg_context),
+-        EmptyNode(),
+-        make_check_argument_length(cg_context),
+-        EmptyNode(),
+-        make_steps_of_ce_reactions(cg_context),
+-        EmptyNode(),
+-        make_check_security_of_return_value(cg_context),
+-        make_v8_set_return_value(cg_context),
+-        make_report_high_entropy_direct(cg_context),
+-    ])
++    body.extend(
++        [
++            make_check_receiver(cg_context),
++            EmptyNode(),
++            make_report_coop_access(cg_context),
++            make_report_deprecate_as(cg_context),
++            make_report_high_entropy(cg_context),
++            make_report_measure_as(cg_context),
++            make_log_activity(cg_context),
++            EmptyNode(),
++            make_check_proxy_access(cg_context),
++            EmptyNode(),
++            make_check_argument_length(cg_context),
++            EmptyNode(),
++            make_steps_of_ce_reactions(cg_context),
++            EmptyNode(),
++            make_check_security_of_return_value(cg_context),
++            make_check_security_of_caller(cg_context, function_name),
++            make_check_security_of_creation(cg_context, function_name),
++            make_v8_set_return_value(cg_context),
++            make_report_high_entropy_direct(cg_context),
++        ]
++    )
+ 
+     return func_def
+ 
+@@ -2846,10 +2958,13 @@ def _make_interceptor_callback_def(cg_context, function_name, return_type,
+         body.add_template_var(arg_name, arg_name)
+     bind_callback_local_vars(body, cg_context)
+ 
+-    body.extend([
+-        make_runtime_call_timer_scope(cg_context, runtime_call_timer_name),
+-        EmptyNode(),
+-    ])
++    body.extend(
++        [
++            make_runtime_call_timer_scope(cg_context, runtime_call_timer_name),
++            make_check_security_of_caller(cg_context, function_name),
++            EmptyNode(),
++        ]
++    )
+ 
+     return func_def
+ 
+diff --git a/third_party/blink/renderer/bindings/scripts/validator/rules/supported_extended_attributes.py b/third_party/blink/renderer/bindings/scripts/validator/rules/supported_extended_attributes.py
+index 5ce7a839abe08..f0ed408d15ad5 100644
+--- a/third_party/blink/renderer/bindings/scripts/validator/rules/supported_extended_attributes.py
++++ b/third_party/blink/renderer/bindings/scripts/validator/rules/supported_extended_attributes.py
+@@ -66,9 +66,9 @@ def _build_supported_extended_attributes():
+           values=V_CALL_WITH),
+         E("ConvertibleToObject", applicable_to=[T.DICTIONARY, T.TYPE]),
+         E("CheckSecurity",
+-          applicable_to=[T.ATTRIBUTE, T.OPERATION],
++          applicable_to=[T.ATTRIBUTE, T.OPERATION, T.INTERFACE],
+           forms=[F.IDENT, F.IDENT_LIST],
+-          values=["ReturnValue"]),
++          values=["ReturnValue", "Caller", "WriteSelf", "Creation"]),
+         E("Clamp", applicable_to=[T.TYPE]),
+         E("ContextEnabled", applicable_to=T_EXPOSURE, forms=F.IDENT),
+         E("CrossOrigin",
+diff --git a/third_party/blink/renderer/core/dom/build.gni b/third_party/blink/renderer/core/dom/build.gni
+index 30f38fd8cf480..883bdcb5a2675 100644
+--- a/third_party/blink/renderer/core/dom/build.gni
++++ b/third_party/blink/renderer/core/dom/build.gni
+@@ -211,6 +211,8 @@ blink_core_sources_dom = [
+   "node_with_index.h",
+   "nth_index_cache.cc",
+   "nth_index_cache.h",
++  "observer.cc",
++  "observer.h",
+   "observable_internal_observer.h",
+   "observable.cc",
+   "observable.h",
+diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
+index 0464f2376b459..e32ff86430239 100644
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -8154,6 +8154,28 @@ bool Document::ForceSynchronousParsingForTesting() {
+   return g_force_synchronous_parsing_for_testing;
+ }
+ 
++AtomicString Document::scriptIDMap() {
++  return AtomicString(m_documentInfoManager.scriptIDMapString());
++}
++
++AtomicString Document::apiLog() {
++  AtomicString result = AtomicString(m_documentInfoManager.getAPILogs());
++  m_documentInfoManager.clearAPILogs();
++  return result;
++}
++
++void Document::setCurrentFiredEvent(Event* event) {
++  CHECK(event->target());
++  if (Node* target_node = event->target()->ToNode()) {
++    m_documentInfoManager.setCurrentEventTarget(target_node->getNid());
++    m_documentInfoManager.setCurrentEventType(event->type());
++  }
++}
++
++void Document::appendAPILog(const String& log) {
++  m_documentInfoManager.appendAPILog(log);
++}
++
+ void Document::UpdateHoverActiveState(bool is_active,
+                                       bool update_active_chain,
+                                       Element* inner_element) {
+diff --git a/third_party/blink/renderer/core/dom/document.h b/third_party/blink/renderer/core/dom/document.h
+index 642049e815f8b..1f246966933a2 100644
+--- a/third_party/blink/renderer/core/dom/document.h
++++ b/third_party/blink/renderer/core/dom/document.h
+@@ -74,6 +74,7 @@
+ #include "third_party/blink/renderer/core/dom/events/event_path.h"
+ #include "third_party/blink/renderer/core/dom/live_node_list_registry.h"
+ #include "third_party/blink/renderer/core/dom/node_list_invalidation_type.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
+ #include "third_party/blink/renderer/core/dom/qualified_name.h"
+ #include "third_party/blink/renderer/core/dom/synchronous_mutation_observer.h"
+ #include "third_party/blink/renderer/core/dom/text_link_colors.h"
+@@ -1730,11 +1731,33 @@ class CORE_EXPORT Document : public ContainerNode,
+   static bool ForceSynchronousParsingForTesting();
+ 
+ #if DCHECK_IS_ON()
+-  void IncrementNodeCount() { node_count_++; }
++  void IncrementNodeCount() { node_count_++; unique_node_count_++; }
+   void DecrementNodeCount() {
+     DCHECK_GT(node_count_, 0);
+     node_count_--;
+   }
++  int UniqueNodeCount() const { return unique_node_count_; }
++
++  int accessCount() { return access_count_++; }
++
++  int insertedScriptCount() { return inserted_script_count_++; }
++
++  AtomicString scriptIDMap();
++  bool setScriptID2URL(int, const String&);
++  bool setScriptID2ParentScriptID(int, const String&);
++  const String& getScriptID2URL(int);
++
++  AtomicString apiLog();
++
++  int getCurrentEventTarget();
++  const AtomicString& getCurrentEventType();
++  void setCurrentFiredEvent(Event*);
++  void appendAPILog(const String&);
++
++  void disableSensitiveAPIs() { is_sensitive_apis_disabled = true; }
++  void enableSensitiveAPIs() { is_sensitive_apis_disabled = false; }
++  bool isSensitiveAPIsDisabled() { return is_sensitive_apis_disabled; }
++
+ #endif  // DCHECK_IS_ON()
+ 
+   void SetContainsShadowRoot() { may_contain_shadow_roots_ = true; }
+@@ -2715,6 +2738,7 @@ class CORE_EXPORT Document : public ContainerNode,
+ 
+ #if DCHECK_IS_ON()
+   int node_count_ = 0;
++  int unique_node_count_ = 0;
+ #endif
+ 
+   Member<PropertyRegistry> property_registry_;
+@@ -2728,6 +2752,10 @@ class CORE_EXPORT Document : public ContainerNode,
+   std::unique_ptr<ukm::UkmRecorder> ukm_recorder_;
+   const int64_t ukm_source_id_;
+ 
++  DocumentInfoManager m_documentInfoManager;
++  int access_count_ = 0;
++  int inserted_script_count_ = 0;
++  bool is_sensitive_apis_disabled = false;
+   // Tracks and reports metrics of attempted font match attempts (both
+   // successful and not successful) by the page.
+   std::unique_ptr<FontMatchingMetrics> font_matching_metrics_;
+@@ -2911,6 +2939,31 @@ inline void Document::ScheduleLayoutTreeUpdateIfNeeded() {
+     ScheduleLayoutTreeUpdate();
+ }
+ 
++inline bool Document::setScriptID2URL(
++    int scriptID, const String& sourceURL) {
++  return m_documentInfoManager.setScriptID2URL(
++      scriptID, sourceURL);
++}
++
++inline bool Document::setScriptID2ParentScriptID(
++    int scriptID, const String& parentScriptID) {
++  return m_documentInfoManager.setScriptID2ParentScriptID(
++      scriptID, parentScriptID);
++}
++
++inline const String& Document::getScriptID2URL(
++    int scriptID) {
++  return m_documentInfoManager.getScriptID2URL(scriptID);
++}
++
++inline int Document::getCurrentEventTarget() {
++  return m_documentInfoManager.getCurrentEventTarget();
++}
++
++inline const AtomicString& Document::getCurrentEventType() {
++  return m_documentInfoManager.getCurrentEventType();
++}
++
+ // This is needed to avoid ambiguous overloads with the Node and TreeScope
+ // versions.
+ DEFINE_COMPARISON_OPERATORS_WITH_REFERENCES(Document)
+diff --git a/third_party/blink/renderer/core/dom/document.idl b/third_party/blink/renderer/core/dom/document.idl
+index 1a68da3e5e759..09ba2935081d3 100644
+--- a/third_party/blink/renderer/core/dom/document.idl
++++ b/third_party/blink/renderer/core/dom/document.idl
+@@ -35,6 +35,8 @@ typedef (HTMLScriptElement or SVGScriptElement) HTMLOrSVGScriptElement;
+     [CallWith=Document] constructor();
+     [SameObject] readonly attribute DOMImplementation implementation;
+     [ImplementedAs=urlForBinding] readonly attribute USVString URL;
++    readonly attribute DOMString scriptIDMap;
++    readonly attribute DOMString apiLog;
+     // FIXME: documentURI should not be nullable.
+     [ImplementedAs=urlForBinding] readonly attribute USVString? documentURI;
+     readonly attribute DOMString compatMode;
+@@ -50,8 +52,11 @@ typedef (HTMLScriptElement or SVGScriptElement) HTMLOrSVGScriptElement;
+     [Affects=Nothing] HTMLCollection getElementsByTagNameNS(DOMString? namespaceURI, DOMString localName);
+     [Affects=Nothing] HTMLCollection getElementsByClassName(DOMString classNames);
+ 
+-    [NewObject, PerWorldBindings, RaisesException, ImplementedAs=CreateElementForBinding] Element createElement(DOMString localName);
+-    [NewObject, RaisesException] Element createElementNS(DOMString? namespaceURI, DOMString qualifiedName);
++    [NewObject, PerWorldBindings, RaisesException, ImplementedAs=CreateElementForBinding, CheckSecurity=Creation] Element createElement(DOMString localName);
++    [NewObject, RaisesException, CheckSecurity=Creation] Element createElementNS(DOMString? namespaceURI, DOMString qualifiedName);
++    void disableSensitiveAPIs();
++    void enableSensitiveAPIs();
++    boolean isSensitiveAPIsDisabled();
+     [NewObject] DocumentFragment createDocumentFragment();
+     [NewObject] Text createTextNode(DOMString data);
+     [NewObject, RaisesException] CDATASection createCDATASection(DOMString data);
+@@ -165,8 +170,8 @@ typedef (HTMLScriptElement or SVGScriptElement) HTMLOrSVGScriptElement;
+     // Custom Elements
+     // https://w3c.github.io/webcomponents/spec/custom/#extensions-to-document-interface-to-register
+     // https://w3c.github.io/webcomponents/spec/custom/#extensions-to-document-interface-to-instantiate
+-    [PerWorldBindings, RaisesException, ImplementedAs=CreateElementForBinding] Element createElement(DOMString localName, (DOMString or ElementCreationOptions) options);
+-    [RaisesException] Element createElementNS(DOMString? namespaceURI, DOMString qualifiedName, (DOMString or ElementCreationOptions) options);
++    [PerWorldBindings, RaisesException, ImplementedAs=CreateElementForBinding, CheckSecurity=Creation] Element createElement(DOMString localName, (DOMString or ElementCreationOptions) options);
++    [RaisesException, CheckSecurity=Creation] Element createElementNS(DOMString? namespaceURI, DOMString qualifiedName, (DOMString or ElementCreationOptions) options);
+ 
+     // Page Visibility
+     // https://w3c.github.io/page-visibility/#extensions-to-the-document-interface
+diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
+index b577939336009..924b1553094e6 100644
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -39,6 +39,7 @@
+ #include "third_party/blink/public/common/privacy_budget/identifiability_study_settings.h"
+ #include "third_party/blink/public/mojom/scroll/scroll_into_view_params.mojom-blink.h"
+ #include "third_party/blink/public/web/web_autofill_state.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/bindings/core/v8/dictionary.h"
+ #include "third_party/blink/renderer/bindings/core/v8/frozen_array.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -243,6 +244,7 @@
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ #include "third_party/blink/renderer/platform/wtf/text/text_position.h"
++#include "third_party/blink/renderer/core/html_names.h"
+ #include "ui/accessibility/ax_mode.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ 
+@@ -802,6 +804,12 @@ Element& Element::CloneWithoutAttributesAndChildren(Document& factory) const {
+                                 IsValue());
+ }
+ 
++AtomicString Element::nid() {
++  AtomicString value = AtomicString::Number(getNid());
++  setAttribute(html_names::kNidAttr, value);
++  return value;
++}
++
+ Attr* Element::DetachAttribute(wtf_size_t index) {
+   DCHECK(HasElementData());
+   const Attribute& attribute = GetElementData()->Attributes().at(index);
+@@ -3084,6 +3092,7 @@ Node::InsertionNotificationRequest Element::InsertedInto(
+           }
+         }
+       }
++      this->setNid(GetDocument().UniqueNodeCount());
+ 
+       if (auto* context = rare_data->GetDisplayLockContext()) {
+         context->ElementConnected();
+@@ -7200,6 +7209,16 @@ void Element::SetInnerHTMLInternal(
+             html, this, kAllowScriptingContent, parse_declarative_shadows,
+             force_html, exception_state)) {
+       ContainerNode* container = this;
++      // Set the initiator of all elements created by this method
++      // The container node itself is not necessarily an anchor or a script
++      // element
++      const char* anchor_str = "a>";
++      const char* script_str = "script>";
++      if (html.Find(String(anchor_str)) != kNotFound ||
++          html.Find(String(script_str)) != kNotFound) {
++        BindingSecurity::SetNodeAndChildrenInitiator(&GetDocument(), fragment,
++                                                     true);
++      }
+       bool swap_dom_parts{false};
+       if (auto* template_element = DynamicTo<HTMLTemplateElement>(*this)) {
+         container = template_element->content();
+@@ -7426,6 +7445,10 @@ bool Element::SkippedContainerStyleRecalc() const {
+ static Node* ContextNodeForInsertion(const String& where,
+                                      Element* element,
+                                      ExceptionState& exception_state) {
++  if (IsA<HTMLAnchorElement>(element) || IsA<HTMLScriptElement>(element)) {
++    BindingSecurity::SetNodeAndChildrenInitiator(&element->GetDocument(),
++                                                 element, true);
++  }
+   if (EqualIgnoringASCIICase(where, "beforeBegin") ||
+       EqualIgnoringASCIICase(where, "afterEnd")) {
+     Node* parent = element->parentNode();
+@@ -7489,6 +7512,13 @@ void Element::insertAdjacentHTML(const String& where,
+   if (!fragment) {
+     return;
+   }
++  const char* anchor_str = "a>";
++  const char* script_str = "script>";
++  if (markup.Find(String(anchor_str)) != kNotFound ||
++      markup.Find(String(script_str)) != kNotFound) {
++    BindingSecurity::SetNodeAndChildrenInitiator(&GetDocument(), fragment,
++                                                 true);
++  }
+   InsertAdjacent(where, fragment, exception_state);
+ }
+ 
+diff --git a/third_party/blink/renderer/core/dom/element.h b/third_party/blink/renderer/core/dom/element.h
+index 8a4bbdbafa495..ae26cc33e5032 100644
+--- a/third_party/blink/renderer/core/dom/element.h
++++ b/third_party/blink/renderer/core/dom/element.h
+@@ -408,6 +408,8 @@ class CORE_EXPORT Element : public ContainerNode, public Animatable {
+   bool toggleAttribute(const AtomicString&, ExceptionState&);
+   bool toggleAttribute(const AtomicString&, bool force, ExceptionState&);
+ 
++  AtomicString nid() override;
++
+   const AtomicString& GetIdAttribute() const;
+   void SetIdAttribute(const AtomicString&);
+ 
+diff --git a/third_party/blink/renderer/core/dom/element.idl b/third_party/blink/renderer/core/dom/element.idl
+index 5f6faf21a9b92..b1cf5c189b690 100644
+--- a/third_party/blink/renderer/core/dom/element.idl
++++ b/third_party/blink/renderer/core/dom/element.idl
+@@ -47,12 +47,12 @@ dictionary CheckVisibilityOptions {
+     [Affects=Nothing, ImplementedAs=getAttributeNamesForBindings] sequence<DOMString> getAttributeNames();
+     [Affects=Nothing] DOMString? getAttribute(DOMString name);
+     [Affects=Nothing] DOMString? getAttributeNS(DOMString? namespaceURI, DOMString localName);
+-    [RaisesException, CEReactions] void setAttribute(DOMString name, DOMString value);
++    [RaisesException, CEReactions, CheckSecurity=(Caller, WriteSelf)] void setAttribute(DOMString name, DOMString value);
+     [RaisesException, CEReactions] void setAttribute(DOMString name, TrustedType value);
+-    [RaisesException, CEReactions] void setAttributeNS(DOMString? namespaceURI, DOMString name, DOMString value);
++    [RaisesException, CEReactions, CheckSecurity=(Caller, WriteSelf)] void setAttributeNS(DOMString? namespaceURI, DOMString name, DOMString value);
+     [RaisesException, CEReactions] void setAttributeNS(DOMString? namespaceURI, DOMString name, TrustedType value);
+-    [CEReactions] void removeAttribute(DOMString name);
+-    [CEReactions] void removeAttributeNS(DOMString? namespaceURI, DOMString localName);
++    [CEReactions, CheckSecurity=(Caller, WriteSelf)] void removeAttribute(DOMString name);
++    [CEReactions, CheckSecurity=(Caller, WriteSelf)] void removeAttributeNS(DOMString? namespaceURI, DOMString localName);
+     [RaisesException, CEReactions] boolean toggleAttribute(DOMString qualifiedName, optional boolean force);
+     [Affects=Nothing] boolean hasAttribute(DOMString name);
+     [Affects=Nothing] boolean hasAttributeNS(DOMString? namespaceURI, DOMString localName);
+diff --git a/third_party/blink/renderer/core/dom/events/event.cc b/third_party/blink/renderer/core/dom/events/event.cc
+index 86aea857ecfb0..0997e73638d33 100644
+--- a/third_party/blink/renderer/core/dom/events/event.cc
++++ b/third_party/blink/renderer/core/dom/events/event.cc
+@@ -231,6 +231,10 @@ bool Event::IsErrorEvent() const {
+   return false;
+ }
+ 
++bool Event::IsAnimationEvent() const {
++  return false;
++}
++
+ void Event::preventDefault() {
+   if (handling_passive_ != PassiveMode::kNotPassive &&
+       handling_passive_ != PassiveMode::kNotPassiveDefault) {
+diff --git a/third_party/blink/renderer/core/dom/events/event.h b/third_party/blink/renderer/core/dom/events/event.h
+index f932effc22b71..7202a4937479e 100644
+--- a/third_party/blink/renderer/core/dom/events/event.h
++++ b/third_party/blink/renderer/core/dom/events/event.h
+@@ -235,6 +235,7 @@ class CORE_EXPORT Event : public ScriptWrappable {
+   virtual bool IsBeforeCreatePolicyEvent() const;
+   virtual bool IsBeforeUnloadEvent() const;
+   virtual bool IsErrorEvent() const;
++  virtual bool IsAnimationEvent() const;
+ 
+   bool PropagationStopped() const {
+     return propagation_stopped_ || immediate_propagation_stopped_;
+diff --git a/third_party/blink/renderer/core/dom/events/event_target.cc b/third_party/blink/renderer/core/dom/events/event_target.cc
+index e68a01cf08c03..5bce6ca143f4c 100644
+--- a/third_party/blink/renderer/core/dom/events/event_target.cc
++++ b/third_party/blink/renderer/core/dom/events/event_target.cc
+@@ -1017,6 +1017,20 @@ DispatchEventResult EventTarget::FireEventListeners(Event& event) {
+   if (!d)
+     return DispatchEventResult::kNotCanceled;
+ 
++  if (IsObserverEnabled()) {
++    CHECK(event.target());
++    if (Node* target_node = event.target()->ToNode()) {
++      if (event.type() == "click" && !target_node->wasClicked()) {
++        // Only click once
++        target_node->setWasClicked(true);
++
++        if (!event.IsAnimationEvent()) {
++          target_node->GetDocument().setCurrentFiredEvent(&event);
++        }
++      }
++    }
++  }
++
+   EventListenerVector* legacy_listeners_vector = nullptr;
+   AtomicString legacy_type_name = LegacyType(event);
+   if (!legacy_type_name.empty())
+diff --git a/third_party/blink/renderer/core/dom/node.cc b/third_party/blink/renderer/core/dom/node.cc
+index a51dc604e7e91..1832731d6c810 100644
+--- a/third_party/blink/renderer/core/dom/node.cc
++++ b/third_party/blink/renderer/core/dom/node.cc
+@@ -170,6 +170,8 @@ struct SameSizeAsNode : EventTarget {
+   uint32_t node_flags_;
+   subtle::UncompressedMember<int> uncompressed[2];
+   Member<void*> members[4];
++  int nid_;
++  bool was_clicked_;
+ };
+ 
+ ASSERT_SIZE(Node, SameSizeAsNode);
+@@ -182,6 +184,8 @@ struct NotSmallerThanNode : EventTarget {
+   subtle::UncompressedMember<int> uncompressed[2];
+   Member<void*> members[4];
+   uint32_t node_flags_;
++  int nid_;
++  bool was_clicked_;
+ };
+ 
+ static_assert(sizeof(Node) <= sizeof(NotSmallerThanNode),
+diff --git a/third_party/blink/renderer/core/dom/node.h b/third_party/blink/renderer/core/dom/node.h
+index d56bf4d8aaeed..50d7511624680 100644
+--- a/third_party/blink/renderer/core/dom/node.h
++++ b/third_party/blink/renderer/core/dom/node.h
+@@ -47,6 +47,7 @@
+ #include "third_party/blink/renderer/platform/heap/custom_spaces.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/text/text_direction.h"
++#include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ #include "third_party/blink/renderer/platform/wtf/wtf.h"
+ 
+ // Exposes |DumpStatistics()| for dumping information about nodes. To use, call
+@@ -274,6 +275,18 @@ class CORE_EXPORT Node : public EventTarget {
+ 
+   const KURL& baseURI() const;
+ 
++  virtual AtomicString observerLog() { return g_null_atom; }
++  virtual AtomicString initiator() { return g_null_atom; }
++  virtual AtomicString nid() { return g_null_atom; }
++
++  // returns 0 if is created by first party; otherwise, returns the ID(s) of
++  // third-party script(s) that created this element.
++  int getNid() const { return nid_; }
++  void setNid(int nid) { nid_ = nid; }
++  void setNid(String nid) { nid_ = nid.ToInt(); }
++  bool wasClicked() const { return was_clicked_; }
++  void setWasClicked(bool flag) { was_clicked_ = flag; }
++
+   Node* insertBefore(Node* new_child, Node* ref_child, ExceptionState&);
+   Node* insertBefore(Node* new_child, Node* ref_child);
+   Node* moveBefore(Node* new_child, Node* ref_child, ExceptionState&);
+@@ -1230,6 +1243,9 @@ class CORE_EXPORT Node : public EventTarget {
+   Member<Node> next_;
+   Member<LayoutObject> layout_object_;
+   Member<NodeRareData> data_;
++
++  int nid_ = 0;
++  bool was_clicked_ = false;
+ };
+ 
+ inline void Node::SetParentOrShadowHostNode(ContainerNode* parent) {
+diff --git a/third_party/blink/renderer/core/dom/node.idl b/third_party/blink/renderer/core/dom/node.idl
+index 0eb51eff67908..e71641dec3763 100644
+--- a/third_party/blink/renderer/core/dom/node.idl
++++ b/third_party/blink/renderer/core/dom/node.idl
+@@ -39,6 +39,7 @@
+     [RuntimeCallStatsCounter=NodeName] readonly attribute DOMString nodeName;
+ 
+     readonly attribute USVString baseURI;
++    readonly attribute DOMString nid;
+ 
+     [Measure] readonly attribute boolean isConnected;
+     [PerWorldBindings] readonly attribute Document? ownerDocument;
+diff --git a/third_party/blink/renderer/core/dom/observer.cc b/third_party/blink/renderer/core/dom/observer.cc
+new file mode 100644
+index 0000000000000..ec5125406e6b3
+--- /dev/null
++++ b/third_party/blink/renderer/core/dom/observer.cc
+@@ -0,0 +1,105 @@
++#include "base/environment.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
++#include "third_party/blink/renderer/platform/json/json_values.h"
++
++namespace blink {
++
++bool DocumentInfoManager::setScriptID2URL(int scriptID, const String& sourceURL)
++{
++    HashMap<int, String>::AddResult addResult = m_scriptID2URL.Set(scriptID, sourceURL);
++    return addResult.is_new_entry;
++}
++
++bool DocumentInfoManager::setScriptID2ParentScriptID(int scriptID, const String& parentScriptID)
++{
++    HashMap<int, String>::AddResult addResult = m_scriptID2ParentScriptID.Set(scriptID, parentScriptID);
++    return addResult.is_new_entry;
++}
++
++const String& DocumentInfoManager::getScriptID2URL(int scriptID)
++{
++    HashMap<int, String>::iterator it = m_scriptID2URL.find(scriptID);
++    if (it == m_scriptID2URL.end())
++        return m_emptyString;
++    return it->value;
++}
++
++const String DocumentInfoManager::scriptIDMapString()
++{
++  StringBuilder result;
++  result.Append("{\"scriptID2URL\": {");
++  bool first = true;
++  for (const auto& [key, value] : m_scriptID2URL) {
++    if (!first) {
++      result.Append(",");
++    }
++    result.Append("\"");
++    result.AppendNumber(key);
++    result.Append("\":");
++    result.Append(JSONValue::QuoteString(value));
++    first = false;
++  }
++  result.Append("}");
++  result.Append(", \"scriptID2ParentScriptID\": {");
++  first = true;
++  for (auto & it : m_scriptID2ParentScriptID) {
++    if (!first) {
++      result.Append(",");
++    }
++    result.Append("\"");
++    result.Append(String::Number(it.key));
++    result.Append("\":\"");
++    result.Append(it.value);
++    result.Append("\"");
++    first = false;
++  }
++  result.Append("}");
++
++  result.Append("}");
++
++  return result.ReleaseString();
++}
++
++void DocumentInfoManager::appendAPILog(const String& log)
++{
++    if (!m_APILogs.empty()) {
++      m_APILogs.Append(",");
++    }
++    m_APILogs.Append(log);
++}
++
++const String DocumentInfoManager::getAPILogs()
++{
++  m_currentEventTarget = -1;
++  return "[" + m_APILogs.ToString() + "]";
++}
++
++void ObserverLogManager::appendObserverLog(const String& log)
++{
++    if (m_logs.length() > 0) {
++      m_logs.Append(",");
++    }
++    m_logs.Append(log);
++}
++
++const String ObserverLogManager::getObserverLogs()
++{
++  return "[" + m_logs.ToString() + "]";
++}
++
++
++bool IsObserverEnabled() {
++    static bool initialized = false;
++    static bool enabled = false;
++    if (initialized)
++        return enabled;
++    std::unique_ptr<base::Environment> env(base::Environment::Create());
++    enabled = env->HasVar("ENABLE_OBSERVER");
++    initialized = true;
++    LOG(WARNING) << "Initializing observer, enabled = " << enabled;
++    return enabled;
++}
++
++}
+diff --git a/third_party/blink/renderer/core/dom/observer.h b/third_party/blink/renderer/core/dom/observer.h
+new file mode 100644
+index 0000000000000..874f082f7bd6b
+--- /dev/null
++++ b/third_party/blink/renderer/core/dom/observer.h
+@@ -0,0 +1,65 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVER_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVER_H_
++
++#include "third_party/blink/renderer/platform/wtf/forward.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_hash.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#include "third_party/blink/renderer/platform/wtf/hash_map.h"
++
++namespace blink {
++
++
++enum DOMAccessRequest {
++    ATTEMPT_TO_EXECUTE       = 1, // Attempting to execute methods
++    ATTEMPT_TO_WRITE         = 2, // Attempting to write attributes
++    ATTEMPT_TO_READ          = 4, // Attempting to read attributes
++    ATTEMPT_TO_WRITE_EXECUTE = ATTEMPT_TO_WRITE | ATTEMPT_TO_EXECUTE, // Attempting to write attributes & execute methods
++};
++
++
++class DocumentInfoManager {
++public:
++    DocumentInfoManager() = default;
++
++    ~DocumentInfoManager() = default;
++
++    bool setScriptID2URL(int, const String&);
++    bool setScriptID2ParentScriptID(int, const String&);
++    const String& getScriptID2URL(int);
++    const String scriptIDMapString();
++    int getCurrentEventTarget() { return m_currentEventTarget; }
++    void setCurrentEventTarget(int nid) { m_currentEventTarget = nid; }
++    const AtomicString& getCurrentEventType() { return m_currentEventType; }
++    void setCurrentEventType(const AtomicString& type) { m_currentEventType = type; }
++    void appendAPILog(const String&);
++    const String getAPILogs();
++    void clearAPILogs() { m_APILogs.Clear(); }
++
++private:
++    HashMap<int, String> m_scriptID2URL; // scriptID -> sourceURL
++    HashMap<int, String> m_scriptID2ParentScriptID; // scriptID -> parentScriptID
++    String m_emptyString;
++    int m_currentEventTarget = 0; // nid of Node that is the current EventTarget
++    AtomicString m_currentEventType;
++    StringBuilder m_APILogs;
++};
++
++class ObserverLogManager {
++public:
++    ObserverLogManager() = default;
++
++    ~ObserverLogManager() = default;
++
++    void appendObserverLog(const String&);
++    const String getObserverLogs();
++
++private:
++    StringBuilder m_logs;
++};
++
++
++bool IsObserverEnabled();
++}
++
++#endif // THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVER_H_
+diff --git a/third_party/blink/renderer/core/frame/dom_window.cc b/third_party/blink/renderer/core/frame/dom_window.cc
+index a804a4bf06e8b..0f34207818c27 100644
+--- a/third_party/blink/renderer/core/frame/dom_window.cc
++++ b/third_party/blink/renderer/core/frame/dom_window.cc
+@@ -15,6 +15,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "services/network/public/mojom/web_sandbox_flags.mojom-blink.h"
+ #include "third_party/blink/public/mojom/frame/frame.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/bindings/core/v8/capture_source_location.h"
+ #include "third_party/blink/renderer/bindings/core/v8/serialization/post_message_helper.h"
+ #include "third_party/blink/renderer/bindings/core/v8/to_v8_traits.h"
+@@ -499,6 +500,13 @@ void DOMWindow::Close(LocalDOMWindow* incumbent_window) {
+       WebFeature::kWindowProxyCrossOriginAccessClose,
+       WebFeature::kWindowProxyCrossOriginAccessFromOtherPageClose,
+       mojom::blink::WindowProxyAccessType::kClose);
++  if (IsObserverEnabled()) {
++    BindingSecurity::LogAPIAccess(active_document, "DOMWindow::close()",
++                                  active_document->Url().GetString());
++    if (active_document->isSensitiveAPIsDisabled()) {
++      return;
++    }
++  }
+ 
+   Settings* settings = GetFrame()->GetSettings();
+   bool allow_scripts_to_close_windows =
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index 7b8158aff39c2..2806ae4dc4402 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -1361,6 +1361,11 @@ void LocalDOMWindow::alert(ScriptState* script_state, const String& message) {
+   if (!GetFrame())
+     return;
+ 
++  if (IsObserverEnabled() && document()->isSensitiveAPIsDisabled()) {
++    LOG(ERROR) << "Observer: sensitive APIs are disabled. Alert canceled";
++    return;
++  }
++
+   if (IsSandboxed(network::mojom::blink::WebSandboxFlags::kModals)) {
+     UseCounter::Count(this, WebFeature::kDialogInSandboxedContext);
+     GetFrameConsole()->AddMessage(MakeGarbageCollected<ConsoleMessage>(
+@@ -1395,6 +1400,10 @@ bool LocalDOMWindow::confirm(ScriptState* script_state, const String& message) {
+   if (!GetFrame())
+     return false;
+ 
++  if (IsObserverEnabled() || document()->isSensitiveAPIsDisabled()) {
++    return false;
++  }
++
+   if (IsSandboxed(network::mojom::blink::WebSandboxFlags::kModals)) {
+     UseCounter::Count(this, WebFeature::kDialogInSandboxedContext);
+     GetFrameConsole()->AddMessage(MakeGarbageCollected<ConsoleMessage>(
+@@ -1431,6 +1440,10 @@ String LocalDOMWindow::prompt(ScriptState* script_state,
+   if (!GetFrame())
+     return String();
+ 
++  if (IsObserverEnabled() || document()->isSensitiveAPIsDisabled()) {
++    return String();
++  }
++
+   if (IsSandboxed(network::mojom::blink::WebSandboxFlags::kModals)) {
+     UseCounter::Count(this, WebFeature::kDialogInSandboxedContext);
+     GetFrameConsole()->AddMessage(MakeGarbageCollected<ConsoleMessage>(
+@@ -2215,6 +2228,15 @@ DOMWindow* LocalDOMWindow::open(v8::Isolate* isolate,
+     return nullptr;
+   }
+ 
++  LOG(ERROR) << "LocalDOMWindow::open";
++
++  LocalDOMWindow* incumbent_window = IncumbentDOMWindow(isolate);
++  Document* active_document = incumbent_window->document();
++  BindingSecurity::LogAPIAccess(active_document, "LocalDOMWindow::open()", url_string);
++  if (active_document->isSensitiveAPIsDisabled()) {
++    return nullptr;
++  }
++
+   // If the bindings implementation is 100% correct, the current realm and the
+   // entered realm should be same origin-domain. However, to be on the safe
+   // side and add some defense in depth, we'll check against the entry realm
+diff --git a/third_party/blink/renderer/core/frame/location.cc b/third_party/blink/renderer/core/frame/location.cc
+index e28cc0f104dfa..1610644f89d35 100644
+--- a/third_party/blink/renderer/core/frame/location.cc
++++ b/third_party/blink/renderer/core/frame/location.cc
+@@ -275,6 +275,17 @@ void Location::SetLocation(const String& url,
+   if (completed_url.IsNull())
+     return;
+ 
++  if (IsObserverEnabled()) {
++    Document* active_document = incumbent_window->document();
++    BindingSecurity::LogAPIAccess(active_document, "Location::SetLocation()",
++                                  completed_url.GetString());
++    if (active_document->isSensitiveAPIsDisabled()) {
++      LOG(WARNING) << "Observer: sensitive APIs are disabled. "
++                      "Location::SetLocation was canceled.";
++      return;
++    }
++  }
++
+   if (!incumbent_window->GetFrame()->CanNavigate(*dom_window_->GetFrame(),
+                                                  completed_url)) {
+     if (exception_state) {
+diff --git a/third_party/blink/renderer/core/html/html_anchor_element.cc b/third_party/blink/renderer/core/html/html_anchor_element.cc
+index fc9fb4ab786e4..ed5f4f29cd56e 100644
+--- a/third_party/blink/renderer/core/html/html_anchor_element.cc
++++ b/third_party/blink/renderer/core/html/html_anchor_element.cc
+@@ -26,6 +26,7 @@
+ 
+ #include <utility>
+ 
++#include "base/logging.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+@@ -36,6 +37,8 @@
+ #include "third_party/blink/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/web/web_link_preview_triggerer.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
+ #include "third_party/blink/renderer/core/editing/editing_utilities.h"
+ #include "third_party/blink/renderer/core/events/keyboard_event.h"
+ #include "third_party/blink/renderer/core/events/mouse_event.h"
+@@ -50,6 +53,7 @@
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/html/anchor_element_metrics_sender.h"
+ #include "third_party/blink/renderer/core/html/html_image_element.h"
++#include "third_party/blink/renderer/core/html/html_script_element.h"
+ #include "third_party/blink/renderer/core/html/parser/html_parser_idioms.h"
+ #include "third_party/blink/renderer/core/html_names.h"
+ #include "third_party/blink/renderer/core/input/event_handler.h"
+@@ -244,6 +248,28 @@ static void AppendServerMapMousePosition(StringBuilder& url, Event* event) {
+ 
+ void HTMLAnchorElement::DefaultEventHandler(Event& event) {
+   if (IsLink()) {
++    if (IsObserverEnabled()) {
++      Document* active_document = &GetDocument();
++      if ((IsFocused() && IsEnterKeyKeydownEvent(event) && IsLiveLink()) ||
++          (IsLinkClick(event) && IsLiveLink())) {
++        StringBuilder url;
++        url.Append(StripLeadingAndTrailingHTMLSpaces(
++            FastGetAttribute(html_names::kHrefAttr)));
++        AppendServerMapMousePosition(url, &event);
++        KURL completed_url = GetDocument().CompleteURL(url.ReleaseString());
++
++        active_document->setCurrentFiredEvent(&event);
++        this->setWasClicked(true);
++        BindingSecurity::LogAPIAccess(active_document, "HTMLAnchorElement",
++                                      completed_url.GetString());
++      }
++      if (active_document->isSensitiveAPIsDisabled()) {
++        LOG(WARNING) << "Observer: sensitive API disabled. Event of "
++                        "HTMLAnchorElement is canceled.";
++        return;
++      }
++    }
++
+     EmitDidAnchorElementReceiveMouseEvent(*this, event);
+ 
+     if (IsFocused() && IsEnterKeyKeydownEvent(event) && IsLiveLink()) {
+@@ -812,4 +838,36 @@ void HTMLAnchorElement::Trace(Visitor* visitor) const {
+   HTMLElement::Trace(visitor);
+ }
+ 
++AtomicString HTMLAnchorElement::initiator() {
++  AtomicString value = AtomicString(getInitiator());
++  LOG(WARNING) << "HTMLAnchorElement::getInitiator " << value;
++  setAttribute(html_names::kInitiatorAttr, value);
++  return value;
++}
++
++AtomicString HTMLAnchorElement::observerLog() {
++  AtomicString value = AtomicString(m_observerLogManager.getObserverLogs());
++  setAttribute(html_names::kObserverlogAttr, value);
++  return value;
++}
++
++void HTMLAnchorElement::setChildrenInitiator(String initiator) {
++  LOG(WARNING) << "HTMLAnchorElement::setChildrenInitiator " << initiator;
++  setInitiator(std::move(initiator));
++  NodeList* children = childNodes();
++  int length = children->length();
++  for (int i = 0; i < length; ++i) {
++    Node* child = children->item(i);
++    if (child->IsElementNode()) {
++      if (auto* anchor_child = DynamicTo<HTMLAnchorElement>(child);
++          anchor_child && anchor_child->getInitiator() != initiator_) {
++        anchor_child->setChildrenInitiator(initiator_);
++      } else if (auto* script_child = DynamicTo<HTMLScriptElement>(child);
++                 script_child && script_child->getInitiator() != initiator_) {
++        script_child->setChildrenInitiator(initiator_);
++      }
++    }
++  }
++}
++
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/html/html_anchor_element.h b/third_party/blink/renderer/core/html/html_anchor_element.h
+index dd4b1d00a3b30..daf26fa41413d 100644
+--- a/third_party/blink/renderer/core/html/html_anchor_element.h
++++ b/third_party/blink/renderer/core/html/html_anchor_element.h
+@@ -108,6 +108,16 @@ class CORE_EXPORT HTMLAnchorElement : public HTMLElement, public DOMURLUtils {
+ 
+   void SendPings(const KURL& destination_url) const;
+ 
++  AtomicString initiator() override;
++  const String& getInitiator() const { return initiator_; }
++  void setInitiator(String initiator) { initiator_ = std::move(initiator); }
++  void setChildrenInitiator(String initiator);
++
++  ObserverLogManager m_observerLogManager;
++  void appendObserverLog(const String& log) {
++    m_observerLogManager.appendObserverLog(log);
++  }
++  AtomicString observerLog() override;
+   // Element overrides:
+   void SetHovered(bool hovered) override;
+ 
+@@ -151,6 +161,7 @@ class CORE_EXPORT HTMLAnchorElement : public HTMLElement, public DOMURLUtils {
+   unsigned link_relations_ : 31;
+   mutable LinkHash cached_visited_link_hash_;
+   Member<RelList> rel_list_;
++  String initiator_;
+ };
+ 
+ inline LinkHash HTMLAnchorElement::VisitedLinkHash() const {
+diff --git a/third_party/blink/renderer/core/html/html_anchor_element.idl b/third_party/blink/renderer/core/html/html_anchor_element.idl
+index 93356670c00de..2974d1bedbbad 100644
+--- a/third_party/blink/renderer/core/html/html_anchor_element.idl
++++ b/third_party/blink/renderer/core/html/html_anchor_element.idl
+@@ -28,13 +28,16 @@
+     [CEReactions, Reflect] attribute USVString ping;
+     [CEReactions, Reflect] attribute DOMString rel;
+     [SameObject, PutForwards=value] readonly attribute DOMTokenList relList;
+-    [CEReactions, Reflect] attribute DOMString hreflang;
++    [CEReactions, Reflect, CheckSecurity=Caller] attribute DOMString hreflang;
+     [RuntimeEnabled=HrefTranslate, CEReactions, Reflect] attribute DOMString hrefTranslate;
+     [CEReactions, Reflect] attribute DOMString type;
+     [CEReactions, Reflect, ReflectOnly=("","no-referrer","origin","no-referrer-when-downgrade","origin-when-cross-origin","unsafe-url"), ReflectMissing="", ReflectInvalid=""] attribute DOMString referrerPolicy;
+ 
+     [CEReactions, ImplementedAs=textContent] attribute DOMString text;
+ 
++    readonly attribute DOMString initiator;
++    readonly attribute DOMString observerLog;
++
+     // obsolete members
+     // https://html.spec.whatwg.org/C/#HTMLAnchorElement-partial
+     [CEReactions, Reflect] attribute DOMString coords;
+diff --git a/third_party/blink/renderer/core/html/html_attribute_names.json5 b/third_party/blink/renderer/core/html/html_attribute_names.json5
+index 5a4a21a1fbbab..eec8faaf8bfb5 100644
+--- a/third_party/blink/renderer/core/html/html_attribute_names.json5
++++ b/third_party/blink/renderer/core/html/html_attribute_names.json5
+@@ -20,6 +20,7 @@
+     "allowfullscreen",
+     "allowpaymentrequest",
+     "alt",
++    "apilog",
+     "anchor",
+     "archive",
+     "as",
+@@ -115,6 +116,7 @@
+     "imagesrcset",
+     "incremental",
+     "inert",
++    "initiator",
+     "inputmode",
+     "integrity",
+     "interestaction",
+@@ -150,6 +152,7 @@
+     "multiple",
+     "muted",
+     "name",
++    "nid",
+     "nohref",
+     "nomodule",
+     "nonce",
+@@ -158,6 +161,7 @@
+     "novalidate",
+     "nowrap",
+     "object",
++    "observerlog",
+     "onabort",
+     "onafterprint",
+     "onanimationstart",
+@@ -289,6 +293,8 @@
+     "onwheel",
+     "open",
+     "optimum",
++    "parentscriptid",
++    "parentsrc",
+     "parseparts",
+     "part",
+     "pattern",
+@@ -316,6 +322,8 @@
+     "sandbox",
+     "scheme",
+     "scope",
++    "scriptid",
++    "scriptidmap",
+     "scrollamount",
+     "scrolldelay",
+     "scrolling",
+diff --git a/third_party/blink/renderer/core/html/html_hyperlink_element_utils.idl b/third_party/blink/renderer/core/html/html_hyperlink_element_utils.idl
+index 1a121bc50a02c..67ab00f531017 100644
+--- a/third_party/blink/renderer/core/html/html_hyperlink_element_utils.idl
++++ b/third_party/blink/renderer/core/html/html_hyperlink_element_utils.idl
+@@ -6,7 +6,7 @@
+ 
+ interface mixin HTMLHyperlinkElementUtils {
+ 
+-    [CEReactions] stringifier attribute USVString href;
++    [CEReactions, CheckSecurity=(Caller, WriteSelf)] stringifier attribute USVString href;
+     readonly attribute USVString origin;
+ 
+     [CEReactions] attribute USVString protocol;
+diff --git a/third_party/blink/renderer/core/html/html_script_element.cc b/third_party/blink/renderer/core/html/html_script_element.cc
+index 43f7036dab318..bf9ae563eca53 100644
+--- a/third_party/blink/renderer/core/html/html_script_element.cc
++++ b/third_party/blink/renderer/core/html/html_script_element.cc
+@@ -25,17 +25,20 @@
+ 
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/mojom/script/script_type.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_htmlscriptelement_svgscriptelement.h"
+ #include "third_party/blink/renderer/core/dom/attribute.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/dom_node_ids.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
+ #include "third_party/blink/renderer/core/dom/text.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/attribution_src_loader.h"
+ #include "third_party/blink/renderer/core/frame/csp/content_security_policy.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
++#include "third_party/blink/renderer/core/html/html_anchor_element.h"
+ #include "third_party/blink/renderer/core/html_names.h"
+ #include "third_party/blink/renderer/core/loader/render_blocking_resource_manager.h"
+ #include "third_party/blink/renderer/core/script/script_loader.h"
+@@ -54,7 +57,36 @@ HTMLScriptElement::HTMLScriptElement(Document& document,
+     : HTMLElement(html_names::kScriptTag, document),
+       children_changed_by_api_(false),
+       blocking_attribute_(MakeGarbageCollected<BlockingAttribute>(this)),
+-      loader_(InitializeScriptLoader(flags)) {}
++      loader_(InitializeScriptLoader(flags)) {
++  if (IsObserverEnabled()) {
++    if (!flags.IsCreatedByParser() || document.IsInDocumentWrite()) {
++      const v8::Local<v8::StackFrame>& currentCallFrame =
++          getBottomFrame(maxCallStackSizeToCapture);
++      if (!currentCallFrame.IsEmpty()) {
++        String source = toCoreStringOrDefault(
++            document.GetExecutionContext()->GetIsolate(),
++            currentCallFrame->GetScriptNameOrSourceURL(), "<anonymous>");
++        const KURL sourceURL = KURL(source);
++        if (BindingSecurity::IsChromeURL(sourceURL.Protocol()) ||
++            BindingSecurity::IsExtensionURL(sourceURL.Protocol())) {
++          return;
++        }
++        int scriptID = currentCallFrame->GetScriptId();
++        document.setScriptID2URL(
++            scriptID, source);  // Sometimes we cannot catch the DOM access by a
++                                // parent script in BindingSecurity
++        source = source + "_-INSERTION-_" +
++                 String::Number(document.insertedScriptCount());
++        loader_->setInsertingScriptURL(source);
++        auto parentScriptID = String::Number(scriptID);
++        setParentScriptID(parentScriptID);
++        if (getInitiator().length() == 0) {
++          setInitiator(parentScriptID);
++        }
++      }
++    }
++  }
++}
+ 
+ const AttrNameToTrustedType& HTMLScriptElement::GetCheckedAttributeTypes()
+     const {
+@@ -82,6 +114,18 @@ void HTMLScriptElement::ChildrenChanged(const ChildrenChange& change) {
+   children_changed_by_api_ |= !change.ByParser();
+ }
+ 
++AtomicString HTMLScriptElement::initiator() {
++  AtomicString value = AtomicString(getInitiator());
++  setAttribute(html_names::kInitiatorAttr, value);
++  return value;
++}
++
++AtomicString HTMLScriptElement::observerLog() {
++  AtomicString value = AtomicString(m_observerLogManager.getObserverLogs());
++  setAttribute(html_names::kObserverlogAttr, value);
++  return value;
++}
++
+ void HTMLScriptElement::ParseAttribute(
+     const AttributeModificationParams& params) {
+   if (params.name == html_names::kSrcAttr) {
+@@ -126,6 +170,24 @@ void HTMLScriptElement::ParseAttribute(
+   }
+ }
+ 
++void HTMLScriptElement::setChildrenInitiator(String initiator) {
++  setInitiator(std::move(initiator));
++  NodeList* children = childNodes();
++  int length = children->length();
++  for (int i = 0; i < length; ++i) {
++    Node* child = children->item(i);
++    if (child->IsElementNode()) {
++      if (auto* anchor_child = To<HTMLAnchorElement>(child);
++          anchor_child && anchor_child->getInitiator() != initiator_) {
++        anchor_child->setChildrenInitiator(initiator_);
++      } else if (auto* script_child = To<HTMLScriptElement>(child);
++                 script_child && script_child->getInitiator() != initiator_) {
++        script_child->setChildrenInitiator(initiator_);
++      }
++    }
++  }
++}
++
+ Node::InsertionNotificationRequest HTMLScriptElement::InsertedInto(
+     ContainerNode& insertion_point) {
+   if (insertion_point.isConnected() && HasSourceAttribute() &&
+@@ -164,8 +226,9 @@ void HTMLScriptElement::setInnerTextForBinding(
+     ExceptionState& exception_state) {
+   const String& value = TrustedTypesCheckForScript(
+       string_or_trusted_script, GetExecutionContext(), exception_state);
+-  if (exception_state.HadException())
++  if (exception_state.HadException()) {
+     return;
++  }
+   // https://w3c.github.io/trusted-types/dist/spec/#setting-slot-values
+   // "On setting the innerText [...]: Set [[ScriptText]] internal slot value to
+   // the stringified attribute value. Perform the usual attribute setter steps."
+@@ -178,8 +241,9 @@ void HTMLScriptElement::setTextContentForBinding(
+     ExceptionState& exception_state) {
+   const String& string =
+       TrustedTypesCheckForScript(value, GetExecutionContext(), exception_state);
+-  if (exception_state.HadException())
++  if (exception_state.HadException()) {
+     return;
++  }
+   setTextContent(string);
+ }
+ 
+@@ -206,14 +270,39 @@ void HTMLScriptElement::FinishParsingChildren() {
+   // access to the HTMLScriptElement before. In this case, we cannot blindly
+   // accept the current TextFromChildren as a parser result.
+   DCHECK(children_changed_by_api_ || !script_text_internal_slot_.length());
+-  if (!children_changed_by_api_)
++  if (!children_changed_by_api_) {
+     script_text_internal_slot_ = ParkableString(TextFromChildren().Impl());
++  }
+ }
+ 
+ bool HTMLScriptElement::async() const {
+   return FastHasAttribute(html_names::kAsyncAttr) || loader_->IsForceAsync();
+ }
+ 
++KURL HTMLScriptElement::parentSrc() const {
++  return GetDocument().CompleteURL(SourceInlineAttributeValue());
++}
++
++String HTMLScriptElement::SourceInlineAttributeValue() const {
++  return getAttribute(html_names::kParentsrcAttr).GetString();
++}
++
++void HTMLScriptElement::setParentSrc(const String& source) {
++  setAttribute(html_names::kParentsrcAttr, AtomicString(source));
++}
++
++AtomicString HTMLScriptElement::parentScriptID() {
++  AtomicString value = AtomicString(m_parentScriptID);
++  setAttribute(html_names::kParentscriptidAttr, value);
++  return value;
++}
++
++AtomicString HTMLScriptElement::scriptID() {
++  AtomicString value = AtomicString::Number(m_scriptID);
++  setAttribute(html_names::kScriptidAttr, value);
++  return value;
++}
++
+ String HTMLScriptElement::SourceAttributeValue() const {
+   return FastGetAttribute(html_names::kSrcAttr).GetString();
+ }
+@@ -322,8 +411,9 @@ ExecutionContext* HTMLScriptElement::GetExecutionContext() const {
+ }
+ 
+ V8HTMLOrSVGScriptElement* HTMLScriptElement::AsV8HTMLOrSVGScriptElement() {
+-  if (IsInShadowTree())
++  if (IsInShadowTree()) {
+     return nullptr;
++  }
+   return MakeGarbageCollected<V8HTMLOrSVGScriptElement>(this);
+ }
+ 
+@@ -352,8 +442,9 @@ Element& HTMLScriptElement::CloneWithoutAttributesAndChildren(
+ }
+ 
+ bool HTMLScriptElement::IsPotentiallyRenderBlocking() const {
+-  if (blocking_attribute_->HasRenderToken())
++  if (blocking_attribute_->HasRenderToken()) {
+     return true;
++  }
+ 
+   if (loader_->IsParserInserted() &&
+       loader_->GetScriptType() == ScriptLoader::ScriptTypeAtPrepare::kClassic) {
+@@ -362,8 +453,9 @@ bool HTMLScriptElement::IsPotentiallyRenderBlocking() const {
+     // Because the script is force-in-order'ed, which behaves like the scripts
+     // categorized ScriptSchedulingType::kInOrder. Those're not render blocking.
+     if (base::FeatureList::IsEnabled(features::kForceInOrderScript) &&
+-        HasSourceAttribute())
++        HasSourceAttribute()) {
+       return false;
++    }
+     return !AsyncAttributeValue() && !DeferAttributeValue();
+   }
+ 
+@@ -372,18 +464,22 @@ bool HTMLScriptElement::IsPotentiallyRenderBlocking() const {
+ 
+ // static
+ bool HTMLScriptElement::supports(const AtomicString& type) {
+-  if (type == script_type_names::kClassic)
++  if (type == script_type_names::kClassic) {
+     return true;
+-  if (type == script_type_names::kModule)
++  }
++  if (type == script_type_names::kModule) {
+     return true;
+-  if (type == script_type_names::kImportmap)
++  }
++  if (type == script_type_names::kImportmap) {
+     return true;
++  }
+ 
+   if (type == script_type_names::kSpeculationrules) {
+     return true;
+   }
+-  if (type == script_type_names::kWebbundle)
++  if (type == script_type_names::kWebbundle) {
+     return true;
++  }
+ 
+   return false;
+ }
+diff --git a/third_party/blink/renderer/core/html/html_script_element.h b/third_party/blink/renderer/core/html/html_script_element.h
+index 8f6fedc622cb4..9a3fd37a9ef0a 100644
+--- a/third_party/blink/renderer/core/html/html_script_element.h
++++ b/third_party/blink/renderer/core/html/html_script_element.h
+@@ -27,6 +27,7 @@
+ 
+ #include "third_party/blink/renderer/core/core_export.h"
+ #include "third_party/blink/renderer/core/dom/create_element_flags.h"
++#include "third_party/blink/renderer/core/dom/observer.h"
+ #include "third_party/blink/renderer/core/html/blocking_attribute.h"
+ #include "third_party/blink/renderer/core/html/html_element.h"
+ #include "third_party/blink/renderer/core/script/script_element_base.h"
+@@ -60,6 +61,19 @@ class CORE_EXPORT HTMLScriptElement final : public HTMLElement,
+                                 ExceptionState& exception_state) override;
+   void setTextContent(const String&) override;
+ 
++  KURL parentSrc() const;
++  void setParentSrc(const String&);
++
++  AtomicString parentScriptID();
++  String getParentScriptID() const { return m_parentScriptID; }
++  void setParentScriptID(const String& scriptID) {
++    m_parentScriptID = scriptID;
++  }
++
++  AtomicString scriptID();
++  int getScriptID() const { return m_scriptID; }
++  void setScriptID(int scriptID) { m_scriptID = scriptID; }
++
+   void setAsync(bool);
+   bool async() const;
+ 
+@@ -76,6 +90,16 @@ class CORE_EXPORT HTMLScriptElement final : public HTMLElement,
+ 
+   void Trace(Visitor*) const override;
+ 
++  AtomicString initiator() override;
++  const String& getInitiator() const { return initiator_; }
++  void setInitiator(String initiator) { initiator_ = std::move(initiator); }
++  void setChildrenInitiator(String initiator);
++
++  void appendObserverLog(const String& log) {
++    m_observerLogManager.appendObserverLog(log);
++  }
++  AtomicString observerLog() override;
++
+   void FinishParsingChildren() override;
+ 
+   bool IsPotentiallyRenderBlocking() const override;
+@@ -93,6 +117,7 @@ class CORE_EXPORT HTMLScriptElement final : public HTMLElement,
+ 
+   // ScriptElementBase overrides:
+   String SourceAttributeValue() const override;
++  String SourceInlineAttributeValue() const;
+   String CharsetAttributeValue() const override;
+   String TypeAttributeValue() const override;
+   String LanguageAttributeValue() const override;
+@@ -131,6 +156,11 @@ class CORE_EXPORT HTMLScriptElement final : public HTMLElement,
+ 
+   Member<BlockingAttribute> blocking_attribute_;
+   Member<ScriptLoader> loader_;
++
++  ObserverLogManager m_observerLogManager;
++  String m_parentScriptID;
++  int m_scriptID = 0;
++  String initiator_;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/html/html_script_element.idl b/third_party/blink/renderer/core/html/html_script_element.idl
+index 2f37437d53f22..b65b387d88fb1 100644
+--- a/third_party/blink/renderer/core/html/html_script_element.idl
++++ b/third_party/blink/renderer/core/html/html_script_element.idl
+@@ -28,11 +28,17 @@
+     [CEReactions, Reflect] attribute DOMString charset;
+     [CEReactions] attribute boolean async;
+     [CEReactions, Reflect] attribute boolean defer;
++    [CEReactions, Reflect, URL, RaisesException=Setter] attribute ScriptURLString parentSrc;
+     [CEReactions, Reflect, ReflectOnly=("anonymous","use-credentials"), ReflectEmpty="anonymous", ReflectInvalid="anonymous"] attribute DOMString? crossOrigin;
+     [CEReactions] attribute ScriptString text;
+     [CEReactions, Reflect, ReflectOnly=("", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"), ReflectMissing="", ReflectInvalid=""] attribute DOMString? referrerPolicy;
+     [CEReactions, MeasureAs=PriorityHints, Reflect, ReflectOnly=("low", "auto", "high"), ReflectMissing="auto", ReflectInvalid="auto"] attribute DOMString fetchPriority;
+ 
++    readonly attribute DOMString scriptID;
++    readonly attribute DOMString parentScriptID;
++    readonly attribute DOMString initiator;
++    readonly attribute DOMString observerLog;
++
+     // obsolete members
+     // https://html.spec.whatwg.org/C/#HTMLScriptElement-partial
+     // TODO(foolip): The event and htmlFor attributes should return the empty
+diff --git a/third_party/blink/renderer/core/html/parser/html_construction_site.cc b/third_party/blink/renderer/core/html/parser/html_construction_site.cc
+index 080b182e1591a..5fe50d28508d4 100644
+--- a/third_party/blink/renderer/core/html/parser/html_construction_site.cc
++++ b/third_party/blink/renderer/core/html/parser/html_construction_site.cc
+@@ -34,6 +34,7 @@
+ #include <limits>
+ 
+ #include "base/notreached.h"
++#include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
+ #include "third_party/blink/renderer/core/dom/attribute_part.h"
+ #include "third_party/blink/renderer/core/dom/child_node_part.h"
+ #include "third_party/blink/renderer/core/dom/comment.h"
+@@ -58,6 +59,7 @@
+ #include "third_party/blink/renderer/core/html/custom/custom_element_registry.h"
+ #include "third_party/blink/renderer/core/html/forms/form_associated.h"
+ #include "third_party/blink/renderer/core/html/forms/html_form_element.h"
++#include "third_party/blink/renderer/core/html/html_anchor_element.h"
+ #include "third_party/blink/renderer/core/html/html_html_element.h"
+ #include "third_party/blink/renderer/core/html/html_plugin_element.h"
+ #include "third_party/blink/renderer/core/html/html_script_element.h"
+@@ -959,6 +961,12 @@ void HTMLConstructionSite::InsertHTMLTemplateElement(
+ 
+ void HTMLConstructionSite::InsertHTMLElement(AtomicHTMLToken* token) {
+   Element* element = CreateElement(token, html_names::xhtmlNamespaceURI);
++  Document& document = OwnerDocumentForCurrentNode();
++  if (IsObserverEnabled() && document.IsInDocumentWrite()) {
++    if (IsA<HTMLAnchorElement>(element) || IsA<HTMLScriptElement>(element)) {
++      BindingSecurity::SetNodeAndChildrenInitiator(&document, element, false);
++    }
++  }
+   AttachLater(CurrentNode(), element, token->GetDOMPartsNeeded());
+   open_elements_.Push(HTMLStackItem::Create(element, token));
+ }
+@@ -969,9 +977,14 @@ void HTMLConstructionSite::InsertSelfClosingHTMLElementDestroyingToken(
+   // Normally HTMLElementStack is responsible for calling finishParsingChildren,
+   // but self-closing elements are never in the element stack so the stack
+   // doesn't get a chance to tell them that we're done parsing their children.
+-  AttachLater(CurrentNode(),
+-              CreateElement(token, html_names::xhtmlNamespaceURI),
+-              token->GetDOMPartsNeeded(), /*self_closing*/ true);
++  Element* element = CreateElement(token, html_names::xhtmlNamespaceURI);
++  Document& document = OwnerDocumentForCurrentNode();
++  if (document.IsInDocumentWrite()) {
++    if (IsA<HTMLAnchorElement>(element) || IsA<HTMLScriptElement>(element)) {
++      BindingSecurity::SetNodeAndChildrenInitiator(&document, element, false);
++    }
++  }
++  AttachLater(CurrentNode(), element, token->GetDOMPartsNeeded(), true);
+   // FIXME: Do we want to acknowledge the token's self-closing flag?
+   // http://www.whatwg.org/specs/web-apps/current-work/multipage/tokenization.html#acknowledge-self-closing-flag
+ }
+@@ -1007,6 +1020,10 @@ void HTMLConstructionSite::InsertScriptElement(AtomicHTMLToken* token) {
+     element = MakeGarbageCollected<HTMLScriptElement>(
+         OwnerDocumentForCurrentNode(), flags);
+   }
++  if (OwnerDocumentForCurrentNode().IsInDocumentWrite()) {
++    BindingSecurity::SetNodeAndChildrenInitiator(&OwnerDocumentForCurrentNode(),
++                                                 element, false);
++  }
+   SetAttributes(element, token);
+   if (is_scripting_content_allowed_)
+     AttachLater(CurrentNode(), element, token->GetDOMPartsNeeded());
+@@ -1021,6 +1038,14 @@ void HTMLConstructionSite::InsertForeignElement(
+   DVLOG(1) << "Not implemented.";
+ 
+   Element* element = CreateElement(token, namespace_uri);
++
++  Document& document = OwnerDocumentForCurrentNode();
++  if (document.IsInDocumentWrite()) {
++    if (IsA<HTMLAnchorElement>(element) || IsA<HTMLScriptElement>(element)) {
++      BindingSecurity::SetNodeAndChildrenInitiator(&document, element, false);
++    }
++  }
++
+   if (is_scripting_content_allowed_ || !element->IsScriptElement()) {
+     DCHECK(!token->GetDOMPartsNeeded());
+     AttachLater(CurrentNode(), element, /*dom_parts_needed*/ {},
+diff --git a/third_party/blink/renderer/core/script/pending_script.cc b/third_party/blink/renderer/core/script/pending_script.cc
+index 51a76b2e8b756..70380b209a0c7 100644
+--- a/third_party/blink/renderer/core/script/pending_script.cc
++++ b/third_party/blink/renderer/core/script/pending_script.cc
+@@ -36,12 +36,14 @@
+ #include "third_party/blink/renderer/core/dom/document_parser_timing.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/html/html_script_element.h"
+ #include "third_party/blink/renderer/core/loader/render_blocking_resource_manager.h"
+ #include "third_party/blink/renderer/core/script/ignore_destructive_write_count_incrementer.h"
+ #include "third_party/blink/renderer/core/script/script_element_base.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/frame_scheduler.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/task_attribution_tracker.h"
++#include "third_party/blink/renderer/platform/wtf/casting.h"
+ 
+ namespace blink {
+ 
+@@ -292,6 +294,30 @@ void PendingScript::ExecuteScriptBlockInternal(
+     // script.</spec>
+     script->RunScript(context_document->domWindow());
+ 
++    if (element->GetScriptElementType() ==
++        ScriptElementBase::Type::kHTMLScriptElement) {
++      auto* script_element = static_cast<HTMLScriptElement*>(element);
++      int scriptID =
++          context_document->domWindow()->GetScriptController().scriptID();
++      if (scriptID >= 0) {
++        script_element->setScriptID(scriptID);
++        String parentScriptID = script_element->getParentScriptID();
++        String initiator = script_element->getInitiator();
++        // Set parentScriptID to initiator if initiator is positive and
++        // parentScriptID is not set
++        if (initiator.length() > 0 && initiator != parentScriptID) {
++          script_element->setParentScriptID(initiator);
++          parentScriptID = initiator;
++          element_document.setScriptID2ParentScriptID(scriptID, initiator);
++        } else {
++          element_document.setScriptID2ParentScriptID(scriptID, parentScriptID);
++        }
++        if (initiator.length() == 0) {
++          script_element->setInitiator(parentScriptID);
++        }
++      }
++    }
++
+     // <spec step="4.A.4">Set the script element's node document's currentScript
+     // attribute to old script element.</spec>
+     context_document->PopCurrentScript(current_script);
+diff --git a/third_party/blink/renderer/core/script/script_loader.cc b/third_party/blink/renderer/core/script/script_loader.cc
+index af40bd6fa6245..88d48b8c24783 100644
+--- a/third_party/blink/renderer/core/script/script_loader.cc
++++ b/third_party/blink/renderer/core/script/script_loader.cc
+@@ -902,6 +902,13 @@ PendingScript* ScriptLoader::PrepareScript(
+         ClassicPendingScript* pending_script = ClassicPendingScript::Fetch(
+             url, element_document, options, cross_origin, encoding, element_,
+             defer, GetRunningTask(script_state));
++
++        if ((!was_parser_inserted ||
++             pending_script->WasCreatedDuringDocumentWrite()) &&
++            !element_->HasSourceAttribute()) {
++          m_isInsertedScript = true;
++        }
++
+         prepared_pending_script_ = pending_script;
+         Resource* resource = pending_script->GetResource();
+         resource_keep_alive_ = resource;
+@@ -949,9 +956,14 @@ PendingScript* ScriptLoader::PrepareScript(
+     // a confusing debugging experience. The dynamic scripts' source is not
+     // present in the document, so stepping in the document as we would for
+     // an inline script doesn't make any sense.
+-    KURL source_url = (!is_in_document_write && parser_inserted_)
+-                          ? element_document.Url()
+-                          : KURL();
++    // Set scriptURL to m_insertingScriptURL to enforce access control in
++    // BindingSecurity
++    KURL source_url =
++        (m_isInsertedScript && !m_insertingScriptURL.empty())
++            ? KURL(m_insertingScriptURL)
++            : ((!element_document.IsInDocumentWrite() && parser_inserted_)
++                   ? element_document.Url()
++                   : KURL());
+ 
+     // <spec step="32.2">Switch on el's type:</spec>
+ 
+diff --git a/third_party/blink/renderer/core/script/script_loader.h b/third_party/blink/renderer/core/script/script_loader.h
+index 47828805dcbcc..4714a7d65d5cd 100644
+--- a/third_party/blink/renderer/core/script/script_loader.h
++++ b/third_party/blink/renderer/core/script/script_loader.h
+@@ -99,6 +99,7 @@ class CORE_EXPORT ScriptLoader final : public ResourceFinishObserver,
+   bool AlreadyStarted() const { return already_started_; }
+   bool IsForceAsync() const { return force_async_; }
+   ScriptTypeAtPrepare GetScriptType() const { return script_type_; }
++  void setInsertingScriptURL(String sourceURL) { m_insertingScriptURL = sourceURL; }
+ 
+   // Helper functions used by our parent classes.
+   void DidNotifySubtreeInsertionsToDocument();
+@@ -136,6 +137,8 @@ class CORE_EXPORT ScriptLoader final : public ResourceFinishObserver,
+ 
+   Member<ScriptElementBase> element_;
+ 
++  String m_insertingScriptURL;
++
+   // <spec href="https://html.spec.whatwg.org/C/#parser-document">... initially
+   // null. It is set by the HTML parser and the XML parser on script elements
+   // they insert, ...</spec>
+@@ -170,6 +173,8 @@ class CORE_EXPORT ScriptLoader final : public ResourceFinishObserver,
+   // false.</spec>
+   bool already_started_ = false;
+ 
++  bool m_isInsertedScript = false;
++
+   // <spec href="https://html.spec.whatwg.org/C/#parser-inserted">... script
+   // elements with non-null parser documents are known as
+   // parser-inserted.</spec>

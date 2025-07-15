@@ -2,23 +2,25 @@
 
 Observer is a system for studying JavaScript click interception practices. It tracks the creation of HTML anchor and script elements, records accesses to HTML anchor elements, and monitors JavaScript event listeners.
 
-Observer is implemented on Chromium (version 64.0.3282.186).
+Observer is implemented on Chromium (version 64.0.3282.186). Due to significant breaking changes in Chromium's codebase over the years, the original version is no longer buildable. This repository has been updated and migrated to Chromium 130.0.6722.0 to ensure compatibility.
 
 You can find more information about Observer in our [USENIX Security 2019 research paper](https://seclab.cse.cuhk.edu.hk/papers/sec19_click_interception.pdf). Please consider citing our paper when using Observer. The BibTeX format file is provided with the source code.
 
 ## Setup and Build
+
 The following build script works only on Debian, Ubuntu and macOS.
 
 ```shell
 # Install depot_tools
 git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-export PATH=$PATH:/path/to/depot_tools
+export DEPOT_TOOLS_PATH="/path/to/depot_tools"
+export PATH=${PATH}:${DEPOT_TOOLS_PATH}
 
 # Fetch source and build
 ./build_observer.sh --all
 ```
 
-The above command will fetch the source code of Chromium version 64.0.3282.186, apply our patch to it, and build Observer.
+The above command will fetch the source code of Chromium version 130.0.6722.0, apply our patch to it, and build Observer.The [official document about building old revisions of Chromium](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/building_old_revisions.md) may help if there's something wrong.
 
 For more information about the options, use:
 
@@ -63,12 +65,13 @@ We provide the following scripts to access the custom attributes. They can be in
 * *js/fireEvents.js*: traverse the DOM tree, click all the clickable HTML element and retrieve the apiLog.
 
 ## Copyright Information
+
 Copyright © 2019 The Chinese University of Hong Kong
 
 ### Additional Notes
 
 Notice that some files in Observer may carry their own copyright notices.
-In particular, Observer's code release contains modifications to source files from the Google Chromium project (https://www.chromium.org), which are distributed under their own original license.
+In particular, Observer's code release contains modifications to source files from the Google Chromium project (<https://www.chromium.org>), which are distributed under their own original license.
 
 ## License
 
@@ -88,6 +91,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Mingxue Zhang <mxzhang@cse.cuhk.edu.hk>
 
-## Contact ##
+Linlin Zhou <freyja@link.cuhk.edu.hk> & Yuting Wu <1155215797@link.cuhk.edu.hk> (Migrated the project to chromium 130.0)
+
+## Contact
 
 [Wei Meng](https://www.cse.cuhk.edu.hk/~wei/) <wei@cse.cuhk.edu.hk>
